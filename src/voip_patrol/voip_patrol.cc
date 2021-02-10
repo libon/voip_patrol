@@ -266,6 +266,12 @@ static float rfactor_to_mos(float rfactor) {
 void TestCall::onDtmfDigit(OnDtmfDigitParam &prm) {
 	LOG(logINFO) << __FUNCTION__ << ":"<<prm.digit;
 	test->dtmf_recv.append(prm.digit);
+        if (test->play_dtmf.length() > 0) {
+          string first_digit = test->play_dtmf.substr(0,1);
+          dialDtmf(first_digit);
+          test->play_dtmf = test->play_dtmf.substr(1);
+          LOG(logINFO) <<__FUNCTION__<<": [dtmf]" << first_digit;
+        }
 }
 
 void TestCall::onCallMediaState(OnCallMediaStateParam &prm) {
@@ -445,8 +451,10 @@ void TestCall::onCallState(OnCallStateParam &prm) {
 	// Create player and recorder
 	if (ci.state == PJSIP_INV_STATE_CONFIRMED){
 		if (test->play_dtmf.length() > 0) {
-			dialDtmf(test->play_dtmf);
-			LOG(logINFO) <<__FUNCTION__<<": [dtmf]" << test->play_dtmf;
+			string first_digit = test->play_dtmf.substr(0,1);
+			dialDtmf(first_digit);
+			test->play_dtmf = test->play_dtmf.substr(1);
+			LOG(logINFO) <<__FUNCTION__<<": [dtmf]" << first_digit;
 		}
 		stream_to_call(this, ci.id, test->remote_user.c_str());
 		if (test->min_mos)
