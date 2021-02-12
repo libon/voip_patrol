@@ -4,7 +4,10 @@ CMakeFiles/
 cmake_install.cmake
 voip_patrol
 tls/*
+xml/register.xml
 xml/makecall*
+scripts/*
+sounds/*
 test_makecall*
 results.json*
 
