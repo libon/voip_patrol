@@ -827,6 +827,7 @@ Config::Config(string result_fn) : result_file(result_fn), action(this) {
 	tls_cfg.certificate = "tls/certificate.pem";
 	tls_cfg.verify_server = 0;
 	tls_cfg.verify_client = 0;
+  nameserver = "8.8.8.8";
 	json_result_count = 0;
 	graceful_shutdown = false;
 	rewrite_ack_transport = false;
@@ -1185,6 +1186,7 @@ int main(int argc, char **argv){
             " --tcp / --udp                     Only listen to TCP/UDP    \n"\
             " --ip-addr <IP>                    Use the specifed address as SIP and RTP addresses\n"\
             " --bound-addr <IP>                 Bind transports to this IP interface\n"\
+            " --nameserver <IP>                 Use this IP as nameserver\n"\
             "                                                             \n";
 			return 0;
 		} else if ( (arg == "-v") || (arg == "--version") ) {
@@ -1234,6 +1236,8 @@ int main(int argc, char **argv){
 			config.tls_cfg.ca_list = argv[++i];
 		} else if (arg == "--tls-cert") {
 			config.tls_cfg.certificate = argv[++i];
+		} else if (arg == "--nameserver") {
+			config.nameserver = argv[++i];
 		} else if ( (arg == "-p") || (arg == "--port")) {
 			if (i + 1 < argc) {
 				port = atoi(argv[++i]);
@@ -1245,8 +1249,8 @@ int main(int argc, char **argv){
 			}
 		}
 	}
-
-	FILELog::ReportingLevel() = (TLogLevel)log_level_console;
+	
+  FILELog::ReportingLevel() = (TLogLevel)log_level_console;
 	if ( log_fn.length() > 0 ) {
 		FILELog::ReportingLevel() = logDEBUG3;
 		FILE* log_fd = fopen(log_fn.c_str(), "w");
@@ -1262,6 +1266,7 @@ int main(int argc, char **argv){
 		"output file: "<<log_test_fn<<"\n"
 		"public_address: "<<config.ip_cfg.public_address<<"\n"
 		"bound_address: "<<config.ip_cfg.bound_address<<"\n"
+		"nameserver: "<<config.nameserver<<"\n"
 		"* * * * * * *\n";
 
 	if (udp_only && tcp_only) {
@@ -1293,7 +1298,7 @@ int main(int argc, char **argv){
 		ep_cfg.logConfig.filename = pj_log_fn.c_str();
 		ep_cfg.medConfig.ecTailLen = 0; // disable echo canceller
 		ep_cfg.medConfig.noVad = 1;
-		//ep_cfg.uaConfig.nameserver.push_back("8.8.8.8");
+		ep_cfg.uaConfig.nameserver.push_back(config.nameserver);
 
 		ep.libInit(ep_cfg);
 		// pjsua_set_null_snd_dev() before calling pjsua_start().

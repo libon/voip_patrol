@@ -119,6 +119,7 @@ class Config {
 		std::string alert_email_to;
 		std::string alert_email_from;
 		std::string alert_server_url;
+		std::string nameserver;
 		TransportId transport_id_udp{-1};
 		TransportId transport_id_tcp{-1};
 		TransportId transport_id_tls{-1};
