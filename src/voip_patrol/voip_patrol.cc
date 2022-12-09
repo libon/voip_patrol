@@ -25,7 +25,7 @@
 #include <pjsua2/call.hpp>
 #include <pjsua2/endpoint.hpp>
 #include <pj/ctype.h>
-#include "util.hpp"
+#include "pj_util.hpp"
 #include <pjsua-lib/pjsua_internal.h>
 #include <algorithm>
 
@@ -223,6 +223,7 @@ TestCall::TestCall(TestAccount *p_acc, int call_id) : Call(*p_acc, call_id) {
 
 TestCall::~TestCall() {
 	if (test) {
+		const std::lock_guard<std::mutex> lock(test->config->checking_calls);
 		delete test;
 	}
 }
@@ -294,13 +295,16 @@ void TestCall::onStreamDestroyed(OnStreamDestroyedParam &prm) {
 		LOG(logINFO) << __FUNCTION__ << " codec name:"<< infos.codecName <<" clock rate:"<< infos.codecClockRate <<" RTP IP:"<< infos.remoteRtpAddress;
 		StreamStat const &stats = getStreamStat(prm.streamIdx);
 		RtcpStat rtcp = stats.rtcp;
+		JbufState jbuf = stats.jbuf;
 		RtcpStreamStat rxStat = rtcp.rxStat;
 		RtcpStreamStat txStat = rtcp.txStat;
 
 		LOG(logINFO) << __FUNCTION__ << ": RTCP Rx jitter:"<<rxStat.jitterUsec.n<<"|"<<rxStat.jitterUsec.mean/1000<<"|"<<rxStat.jitterUsec.max/1000
-                     <<"Usec pkt:"<<rxStat.pkt<<" Kbytes:"<<rxStat.bytes/1024<<" loss:"<<rxStat.loss<<" discard:"<<rxStat.discard;
+                     <<"Usec pkt:"<<rxStat.pkt<<" Kbytes:"<<rxStat.bytes/1024<<" loss:"<<rxStat.loss<<" discard:"<<rxStat.discard<<" discarded frames buffer:"<<jbuf.discard;
 		LOG(logINFO) << __FUNCTION__ << ": RTCP Tx jitter:"<<txStat.jitterUsec.n<<"|"<<txStat.jitterUsec.mean/1000<<"|"<<txStat.jitterUsec.max/1000
                      <<"Usec pkt:"<<txStat.pkt<<" Kbytes:"<<rxStat.bytes/1024<<" loss:"<< txStat.loss<<" discard:"<<txStat.discard;
+
+		// MOS-LQ - Listening Quality
 		/* represent loss dependent effective equipment impairment factor and percentage loss probability */
 		const int Bpl = 25; /* packet-loss robustness factor Bpl is defined as a codec-specific value. */
 		float Ie_eff_rx, Ppl_rx, Ppl_cut_rx, Ie_eff_tx, Ppl_tx, Ppl_cut_tx;
@@ -318,11 +322,40 @@ void TestCall::onStreamDestroyed(OnStreamDestroyedParam &prm) {
 		int rfactor_tx = 100 - Ie_eff_tx;
 		float mos_tx = rfactor_to_mos(rfactor_tx);
 
-		LOG(logINFO) << __FUNCTION__ <<" rtt:"<< rtcp.rttUsec.mean/1000 <<" mos_lq_tx:"<<mos_tx<<" mos_lq_rx:"<<mos_rx;
+		LOG(logINFO) << __FUNCTION__ <<": rtt:"<< rtcp.rttUsec.mean/1000 <<" mos_lq_tx:"<<mos_tx<<" mos_lq_rx:"<<mos_rx;
 		rtt = rtcp.rttUsec.mean/1000;
+
+		// MOS-CQ - Conversational Quality
+		int mT = 100; // minimum  perceivable  delay "mT", 100ms is Applicable to all types of telephone conversations
+		int sT = 1;   // delay  sensitivity "sT", 1 is Applicable to all types of telephone conversations
+		float LOG2 = 0.301;
+		float Id = 0; // impairment delay
+
+		// G.107 : 7.4 Delay impairment factor, Id
+		Ta = rtt/2 + jbuf.avgDelayMsec;
+		if(Ta >= mT) {
+			float X = (log10(Ta/mT)/LOG2);
+			Id = 25.0 * (pow((1+pow(X,6.0*sT)),(1.0/(6.0*sT)))-3.0*pow((1.0+pow(X/3.0,6.0*sT)),(1.0/(6.0*sT)))+2);
+		}
+		int rfactor_rx_cq = rfactor_rx - Id;
+		float mos_rx_cq = rfactor_to_mos(rfactor_rx_cq);
+		LOG(logINFO) << __FUNCTION__ <<": Tx-mos-lq["<<mos_rx<<"] Tx-mos-cq["<<mos_rx_cq<<"] >> Ta["<<Ta<<"]jb-delay-ms["<<jbuf.avgDelayMsec<<"]";
+
+		Ta = rtt/2 + txStat.jitterUsec.mean/500; // extrapolating dynamice jitter buffer ~jitterx2
+		if(Ta >= mT) {
+			float X = (log10(Ta/mT)/LOG2);
+			Id = 25.0 * (pow((1+pow(X,6.0*sT)),(1.0/(6.0*sT)))-3.0*pow((1.0+pow(X/3.0,6.0*sT)),(1.0/(6.0*sT)))+2);
+		}
+		int rfactor_tx_cq = rfactor_tx - Id;
+		float mos_tx_cq = rfactor_to_mos(rfactor_tx);
+		LOG(logINFO) << __FUNCTION__ <<": Rx-mos-lq["<<mos_tx<<"] Rx-mos-cq["<<mos_tx_cq<<"] >> Ta["<<Ta<<"]RTCP_jitterX2ms["<<txStat.jitterUsec.mean/500<<"]";
+
+		// Another interesting study to consider ...
+		// https://www.naun.org/main/NAUN/mcs/2002-124.pdf
+
 		if (test->rtp_stats_count > 0)
 			test->rtp_stats_json = test->rtp_stats_json + ',';
-		test->rtp_stats_json = test->rtp_stats_json + " \"rtp_stats_"+to_string(test->rtp_stats_count)+"\":{\"rtt\":"+to_string(rtt)+","
+		test->rtp_stats_json = test->rtp_stats_json + "{\"rtt\":"+to_string(rtt)+","
 						"\"remote_rtp_socket\": \""+infos.remoteRtpAddress+"\", "
 						"\"codec_name\": \""+infos.codecName+"\", "
 						"\"clock_rate\": \""+to_string(infos.codecClockRate)+"\", "
@@ -340,7 +373,7 @@ void TestCall::onStreamDestroyed(OnStreamDestroyedParam &prm) {
 							"\"pkt\": "+to_string(rxStat.pkt)+", "
 							"\"kbytes\": "+to_string(rxStat.bytes/1024)+", "
 							"\"loss\": "+to_string(rxStat.loss)+", "
-							"\"discard\": "+to_string(rxStat.discard)+", "
+							"\"discard\": "+to_string(jbuf.discard)+", "
 							"\"mos_lq\": "+to_string(mos_rx)+"} "
 						"}";
 		test->rtp_stats_count++;
@@ -483,10 +516,38 @@ TestAccount::TestAccount() {
 	ring_duration=0;
 	call_count=-1;
 	accept_label="-";
+	early_media = false;
+	response_delay = 0;
 }
 
 TestAccount::~TestAccount() {
 	LOG(logINFO) << "[Account] is being deleted: No of calls=" << calls.size() ;
+}
+
+
+void TestAccount::onInstantMessage(OnInstantMessageParam &prm) {
+	LOG(logINFO) << "[Account] instant message received from["<< prm.fromUri<<"]message["<<prm.msgBody<<"]";
+	if (message_count > 0) {
+		message_count--;
+	}
+	
+	if (test) {
+		test->message = prm.msgBody;
+		test->update_result();
+	}
+}
+
+void TestAccount::onInstantMessageStatus(OnInstantMessageStatusParam &prm) {
+	LOG(logINFO) << "[Account] instant message status received code:"<< prm.code;
+	if (test) {
+		LOG(logINFO) << "[Account] instant message status received updating test code:"<< prm.code;
+		test->result_cause_code = (int)prm.code;
+		test->reason = prm.reason;
+		test->update_result();
+	} else {
+		LOG(logINFO) << "[Account] instant message status received, not test found";
+	}
+
 }
 
 void TestAccount::onRegState(OnRegStateParam &prm) {
@@ -551,20 +612,35 @@ void TestAccount::onIncomingCall(OnIncomingCallParam &iprm) {
 			call->test->state = VPT_RUN_WAIT;
 
 		call->test->play_dtmf = play_dtmf;
+		call->test->early_media = early_media;
+		call->test->response_delay = response_delay;
 	}
 	calls.push_back(call);
 	if (call_count > 0)
 		call_count--;
+
 	config->calls.push_back(call);
+
+	for (auto x_hdr : x_headers) {
+		prm.txOption.headers.push_back(x_hdr);
+	}
+
+	if (response_delay > 0) {
+		LOG(logINFO) << __FUNCTION__ << ": Not answering 100 due to response delay: " << response_delay << " ms";
+		return;
+	}
+
+	// Explicitly answer with 100
+	CallOpParam prm_100;
+
+	prm_100.statusCode = PJSIP_SC_TRYING;
+	call->answer(prm_100);
+
 	LOG(logINFO) <<__FUNCTION__<<"code:" << code <<" reason:"<< reason;
 	if (code  >= 100 && code <= 699) {
 		prm.statusCode = (pjsip_status_code) code;
 	} else {
 		prm.statusCode = PJSIP_SC_OK;
-	}
-
-	for (auto x_hdr : x_headers) {
-		prm.txOption.headers.push_back(x_hdr);
 	}
 
 	if (ring_duration > 0) {
@@ -621,6 +697,18 @@ void Test::update_result() {
 		std::string res = "FAIL";
 
 		LOG(logINFO)<<__FUNCTION__;
+
+		if (type == "accept_message") {
+			if (expected_message == "" || expected_message == message) {
+				res= "PASS";
+				success=true;
+			} else {
+				LOG(logINFO)<<__FUNCTION__<<"["<<expected_message<<"]!=["<<message<<"]\n";
+				res= "FAIL";
+				success=false;
+			}
+		}
+
 		if (min_mos > 0 && mos == 0) {
 				return;
 		}
@@ -648,7 +736,7 @@ void Test::update_result() {
 			success=true;
 		}
 
-
+		
 		// JSON report
 		string jsonLocalUri = local_uri;
 		jsonify(&jsonLocalUri);
@@ -726,7 +814,7 @@ void Test::update_result() {
 			result_line_json += ", \"check\":{" + result_checks_json + "}";
 
 		if (rtp_stats && rtp_stats_ready)
-			result_line_json += "," + rtp_stats_json;
+			result_line_json += ", \"rtp_stats\":[" + rtp_stats_json + "]";
 		result_line_json += "}}";
 
 		config->result_file.write(result_line_json);
@@ -822,9 +910,9 @@ void ResultFile::close() {
  */
 
 Config::Config(string result_fn) : result_file(result_fn), action(this) {
-	tls_cfg.ca_list = "tls/ca_list.pem";
-	tls_cfg.private_key = "tls/key.pem";
-	tls_cfg.certificate = "tls/certificate.pem";
+	tls_cfg.ca_list = "";
+	tls_cfg.private_key = "";
+	tls_cfg.certificate = "";
 	tls_cfg.verify_server = 0;
 	tls_cfg.verify_client = 0;
 	json_result_count = 0;
@@ -876,6 +964,8 @@ TestAccount* Config::createAccount(AccountConfig acc_cfg) {
 	TestAccount *account = new TestAccount();
 	accounts.push_back(account);
 	account->config = this;
+	acc_cfg.mediaConfig.transportConfig.port = rtp_cfg.port;
+	LOG(logINFO) <<__FUNCTION__<<" rtp start port:"<< rtp_cfg.port;
 	acc_cfg.mediaConfig.transportConfig.boundAddress = ip_cfg.bound_address;
 	acc_cfg.mediaConfig.transportConfig.publicAddress = ip_cfg.public_address;
 	if (ip_cfg.public_address != "")
@@ -941,8 +1031,8 @@ replay:
 				sh.hValue = ezxml_attr(xml_xhdr, "value");
 				if (sh.hValue.compare(0, 7, "VP_ENV_") == 0){
 					if (const char* val = std::getenv(sh.hValue.c_str())) {
+						LOG(logINFO) <<__FUNCTION__<< ":"<<sh.hValue<<" substitution x-header:"<<sh.hName<<" "<<val;
 						sh.hValue = val;
-						LOG(logINFO) <<__FUNCTION__<< "VP_ENV_ substitution x-header:"<< sh.hName<<" "<<sh.hValue << endl;
 					}
 				}
 				x_hdrs.push_back(sh);
@@ -999,6 +1089,8 @@ replay:
 				action.set_param(param, ezxml_attr(xml_action, param.name.c_str()));
 			}
 			if ( action_type.compare("wait") == 0 ) action.do_wait(params);
+			else if ( action_type.compare("message") == 0 ) action.do_message(params, checks, x_hdrs);
+			else if ( action_type.compare("accept_message") == 0 ) action.do_accept_message(params, checks, x_hdrs);
 			else if ( action_type.compare("call") == 0 ) action.do_call(params, checks, x_hdrs);
 			else if ( action_type.compare("accept") == 0 ) action.do_accept(params, checks, x_hdrs);
 			else if ( action_type.compare("register") == 0 ) action.do_register(params, checks, x_hdrs);
@@ -1114,10 +1206,9 @@ void VoipPatrolEnpoint::onSelectAccount(OnSelectAccountParam &param) {
 		account = config->findAccount("default");
 	}
 	if (!account) return;
-	if (account->response_delay > 0) {
-		LOG(logINFO) <<__FUNCTION__<<" account_index:" << param.accountIndex << " response_delay:" << account->response_delay ;
-		pj_thread_sleep(account->response_delay);
-	}
+
+	LOG(logINFO) << __FUNCTION__ << " account_index:" << param.accountIndex << " response_delay:" << account->response_delay << " ring_duration:" << account->ring_duration;
+
 	AccountInfo acc_info = account->getInfo();
 	param.accountIndex = acc_info.id;
 }
@@ -1158,7 +1249,7 @@ int main(int argc, char **argv){
 	bool tcp_only = false;
 	bool udp_only = false;
 	int timer_ms = 0;
-
+	config.rtp_cfg.port = 4000;
 	ep.config = &config;
 	config.ep = &ep;
 
@@ -1185,7 +1276,8 @@ int main(int argc, char **argv){
             " --tcp / --udp                     Only listen to TCP/UDP    \n"\
             " --ip-addr <IP>                    Use the specifed address as SIP and RTP addresses\n"\
             " --bound-addr <IP>                 Bind transports to this IP interface\n"\
-            "                                                             \n";
+	    " --rtp-port <1-65535>              Starting port of the range used for RTP\n"\
+	    "                                                             \n";
 			return 0;
 		} else if ( (arg == "-v") || (arg == "--version") ) {
 			LOG(logINFO) <<"version: voip_patrol "<<VERSION<<std::endl;
@@ -1224,6 +1316,8 @@ int main(int argc, char **argv){
 				config.ip_cfg.bound_address = "0.0.0.0";
 		} else if (arg == "--bound-addr") {
 			config.ip_cfg.bound_address = argv[++i];
+		} else if (arg == "--rtp-port") {
+			config.rtp_cfg.port = atoi(argv[++i]);
 		} else if (arg == "--tls-privkey") {
 			config.tls_cfg.private_key = argv[++i];
 		} else if (arg == "--tls-verify-client") {
@@ -1347,9 +1441,10 @@ int main(int argc, char **argv){
 		config.createDefaultAccount();
 		config.process(conf_fn, log_test_fn);
 
-		LOG(logINFO) <<__FUNCTION__<<": wait complete all...";
+		LOG(logINFO) <<__FUNCTION__<<": final wait complete all...";
 		vector<ActionParam> params = config.action.get_params("wait");
-		config.action.set_param_by_name(&params, "complete");
+		config.action.set_param_by_name(&params, "complete", "true");
+		config.action.set_param_by_name(&params, "ms", "5000");
 		config.action.do_wait(params);
 
 		LOG(logINFO) <<__FUNCTION__<<": checking alerts...";
@@ -1372,16 +1467,14 @@ int main(int argc, char **argv){
 	while (disconnecting) {
 		disconnecting = false;
 		for (auto & call : config.calls) {
-
 			pjsua_call_info pj_ci;
-			pjsua_call_id call_id;
 			CallInfo ci;
 			if (call->is_disconnecting()) { // wait for call disconnections
 					if (call->test && call->test->completed) config.removeCall(call);
 					disconnecting = true;
 					continue;
 			}
-			pj_status_t status = pjsua_call_get_info(call_id, &pj_ci); 
+			pj_status_t status = pjsua_call_get_info(call->getId(), &pj_ci);
 			LOG(logINFO) << "disconnecting >>> call["<< call->getId() <<"]["<< call <<"] ";
 			if (status != PJ_SUCCESS) {
 				LOG(logINFO) << "can not get call info, removing call["<< call->getId() <<"]["<< call <<"] "<< config.removeCall(call);
@@ -1398,7 +1491,9 @@ int main(int argc, char **argv){
 					LOG(logERROR) <<__FUNCTION__<<" error :" << e.status;
 				}
 			} else {
-				LOG(logINFO) << "removing call["<< call->getId() <<"]["<< call <<"] "<< config.removeCall(call);
+				// LOG(logINFO) << "removing call["<< call->getId() <<"]["<< call <<"] "<< config.removeCall(call);
+				LOG(logINFO) << "disconnected call["<< call->getId() <<"]["<< call <<"]";
+				pj_thread_sleep(500);
 			}
 		}
 		pj_thread_sleep(50);
@@ -1420,5 +1515,3 @@ int main(int argc, char **argv){
 	LOG(logINFO) <<__FUNCTION__<<": Watch completed, exiting  /('l')" ;
 	return ret;
 }
-
-

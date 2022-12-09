@@ -20,6 +20,7 @@
 #define VOIP_PATROL_H
 #include "action.hh"
 #include <pjsua2.hpp>
+
 #include <iostream>
 #include <fstream>
 #include <memory>
@@ -89,6 +90,9 @@ class VoipPatrolEnpoint : public Endpoint {
 
 typedef struct turn_config {
 	bool enabled;
+	bool stun_only;
+	bool sip_stun_use;
+	bool media_stun_use;
 	std::string server;
 	std::string username;
 	std::string password;
@@ -125,6 +129,7 @@ class Config {
 		int json_result_count;
 		Action action;
 		ResultFile result_file;
+		std::mutex checking_calls;
 		struct {
 			string ca_list;
 			string private_key;
@@ -136,6 +141,9 @@ class Config {
 			string public_address{};
 			string bound_address{};
 		} ip_cfg;
+		struct {
+			int port;
+		} rtp_cfg;
 		std::vector<Test *> tests_with_rtp_stats;
 		VoipPatrolEnpoint *ep;
 	private:
@@ -193,7 +201,10 @@ class Test {
 		int ring_duration{0};
 		int rtp_stats_count{0};
 		int max_ringing_duration{0};
+		int response_delay{0};
 		void get_mos();
+		string expected_message;
+		string message;
 		std::string local_user;
 		std::string local_uri;
 		std::string local_contact;
@@ -211,16 +222,18 @@ class Test {
 		int call_id{0};
 		bool recording{false};
 		bool playing{false};
+		bool early_media {false};
 		string record_fn;
 		string reference_fn;
 		string rtp_stats_json;
 		string play;
 		string play_dtmf;
+		string srtp;
 		bool rtp_stats_ready{false};
 		bool queued{false};
 		vector<ActionCheck> checks;
-	private:
 		Config *config;
+	private:
 		std::mutex process_result;
 };
 
@@ -236,6 +249,8 @@ class TestAccount : public Account {
 		void removeCall(Call *call);
 		virtual void onRegState(OnRegStateParam &prm);
 		virtual void onIncomingCall(OnIncomingCallParam &iprm);
+		virtual void onInstantMessage(OnInstantMessageParam &prm);
+		virtual void onInstantMessageStatus(OnInstantMessageStatusParam &prm);
 		int hangup_duration {0};
 		int re_invite_interval {0};
 		int max_duration {0};
@@ -248,9 +263,11 @@ class TestAccount : public Account {
 		bool early_media {false};
 		SipHeaderVector x_headers;
 		int call_count {-1};
+		int message_count {-1};
 		string play;
 		string play_dtmf;
 		string timer;
+		string srtp;
 		call_state_t wait_state;
 		std::string accept_label;
 		string reason;
