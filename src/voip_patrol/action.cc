@@ -23,9 +23,6 @@
 #include <pjsua2/presence.hpp>
 
 namespace {
-void to_lower_inplace(string &value) {
-	std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-}
 
 string normalize_transport_param(const string &transport) {
 	if (transport == "udp6") return "udp";
@@ -72,7 +69,7 @@ bool uri_has_ipv6_host(string uri) {
 
 TransportId select_transport_id(const Config *config, const string &transport, const string &target_uri) {
 	string transport_lc = transport;
-	to_lower_inplace(transport_lc);
+	vp::tolower(transport_lc);
 	bool target_is_v6 = uri_has_ipv6_host(target_uri);
 
 	if (transport_lc == "udp6") return config->transport_id_udp6;
@@ -366,7 +363,7 @@ void Action::do_message(vector<ActionParam> &params, vector<ActionCheck> &checks
 	TestAccount *acc = config->findAccount(from);
 	string account_uri = from;
 	string target_uri = to_uri;
-	to_lower_inplace(transport);
+	vp::tolower(transport);
 	string transport_param = normalize_transport_param(transport);
 	if (transport_param != "udp") {
 		 account_uri = "sip:" + account_uri + ";transport=" + transport_param;
@@ -461,7 +458,7 @@ void Action::do_register(vector<ActionParam> &params, vector<ActionCheck> &check
 		LOG(logERROR) <<__FUNCTION__<<" missing action parameter" ;
 		return;
 	}
-	to_lower_inplace(transport);
+	vp::tolower(transport);
 	string transport_param = normalize_transport_param(transport);
 
 	if (account_name.empty()) account_name = username;
@@ -626,7 +623,7 @@ void Action::do_accept_message(vector<ActionParam> &params, vector<ActionCheck> 
 		LOG(logERROR) <<__FUNCTION__<<" missing action parameters <account>" ;
 		return;
 	}
-	to_lower_inplace(transport);
+	vp::tolower(transport);
 	string transport_param = normalize_transport_param(transport);
 
 	TestAccount *acc = config->findAccount(account_name);
@@ -728,7 +725,7 @@ void Action::do_accept(vector<ActionParam> &params, vector<ActionCheck> &checks,
 		LOG(logERROR) <<__FUNCTION__<<" missing action parameters <account>" ;
 		return;
 	}
-	to_lower_inplace(transport);
+	vp::tolower(transport);
 	string transport_param = normalize_transport_param(transport);
 
 	TestAccount *acc = config->findAccount(account_name);
@@ -893,7 +890,7 @@ void Action::do_call(vector<ActionParam> &params, vector<ActionCheck> &checks, S
 		LOG(logERROR) <<__FUNCTION__<<": missing action parameters for callee/caller" ;
 		return;
 	}
-	to_lower_inplace(transport);
+	vp::tolower(transport);
 	string transport_param = normalize_transport_param(transport);
 
 	string account_uri {caller};
