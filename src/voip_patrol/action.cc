@@ -20,19 +20,19 @@
 #include "action.hh"
 #include "util.hh"
 #include "string.h"
+#include <cctype>
 #include <pjsua2/presence.hpp>
 
 namespace {
 
-string normalize_transport_param(const string &transport) {
-	if (transport == "udp6") return "udp";
-	if (transport == "tcp6") return "tcp";
-	if (transport == "tls6") return "tls";
-	if (transport == "sips6") return "sips";
-	return transport;
+string strip_ip_brackets(const string &addr) {
+	if (addr.size() >= 2 && addr.front() == '[' && addr.back() == ']') {
+		return addr.substr(1, addr.size() - 2);
+	}
+	return addr;
 }
 
-bool uri_has_ipv6_host(string uri) {
+string extract_uri_host(string uri) {
 	auto lt = uri.find('<');
 	auto gt = uri.find('>');
 	if (lt != string::npos && gt != string::npos && gt > lt) {
@@ -56,21 +56,80 @@ bool uri_has_ipv6_host(string uri) {
 	if (query_pos != string::npos)
 		uri = uri.substr(0, query_pos);
 
-	if (!uri.empty() && uri.front() == '[') {
-		auto end = uri.find(']');
+	return uri;
+}
+
+bool is_ipv4_literal_host(const string &host) {
+	if (host.empty()) return false;
+	int dot_count = 0;
+	for (char c : host) {
+		if (c == '.') {
+			++dot_count;
+			continue;
+		}
+		if (!std::isdigit(static_cast<unsigned char>(c))) {
+			return false;
+		}
+	}
+	return dot_count == 3;
+}
+
+bool uri_has_ipv4_host(const string &uri) {
+	string host = extract_uri_host(uri);
+	if (!host.empty() && host.front() == '[') {
+		return false;
+	}
+
+	auto colon = host.rfind(':');
+	if (colon != string::npos && host.find(':') == colon) {
+		host = host.substr(0, colon);
+	}
+
+	return is_ipv4_literal_host(host);
+}
+
+bool is_ipv6_literal_addr(const string &addr) {
+	string normalized = strip_ip_brackets(addr);
+	return !normalized.empty() && normalized.find(':') != string::npos;
+}
+
+string normalize_transport_param(const string &transport) {
+	if (transport == "udp6") return "udp";
+	if (transport == "tcp6") return "tcp";
+	if (transport == "tls6") return "tls";
+	if (transport == "sips6") return "sips";
+	return transport;
+}
+
+bool uri_has_ipv6_host(string uri) {
+	string host = extract_uri_host(uri);
+
+	if (!host.empty() && host.front() == '[') {
+		auto end = host.find(']');
 		if (end != string::npos) {
-			auto inside = uri.substr(1, end - 1);
+			auto inside = host.substr(1, end - 1);
 			return inside.find(':') != string::npos;
 		}
 	}
 
-	return std::count(uri.begin(), uri.end(), ':') >= 2;
+	return std::count(host.begin(), host.end(), ':') >= 2;
+}
+
+bool should_use_ipv6_for_target(const Config *config, const string &target_uri) {
+	if (uri_has_ipv6_host(target_uri)) {
+		return true;
+	}
+	if (uri_has_ipv4_host(target_uri)) {
+		return false;
+	}
+	return is_ipv6_literal_addr(config->ip_cfg.bound_address) ||
+	       is_ipv6_literal_addr(config->ip_cfg.public_address);
 }
 
 TransportId select_transport_id(const Config *config, const string &transport, const string &target_uri) {
 	string transport_lc = transport;
 	vp::tolower(transport_lc);
-	bool target_is_v6 = uri_has_ipv6_host(target_uri);
+	bool target_is_v6 = should_use_ipv6_for_target(config, target_uri);
 
 	if (transport_lc == "udp6") return config->transport_id_udp6;
 	if (transport_lc == "tcp6") return config->transport_id_tcp6;
@@ -85,7 +144,7 @@ TransportId select_transport_id(const Config *config, const string &transport, c
 }
 
 void apply_ipv6_account_config(AccountConfig &acc_cfg, const Config *config, const string &target_uri) {
-	if (!uri_has_ipv6_host(target_uri)) {
+	if (!should_use_ipv6_for_target(config, target_uri)) {
 		return;
 	}
 
