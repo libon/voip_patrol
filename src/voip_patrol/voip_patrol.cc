@@ -283,7 +283,7 @@ void TestCall::onCallTsxState(OnCallTsxStateParam &prm) {
 	if (prm.e.type == PJSIP_EVENT_TSX_STATE && prm.e.body.tsxState.type == PJSIP_EVENT_RX_MSG) {
 		pjsip_rx_data *pjsip_rxdata = (pjsip_rx_data *) prm.e.body.tsxState.src.rdata.pjRxData;
 		if (pjsip_rxdata) {
-			if (pjsip_rxdata->msg_info.msg->type == PJSIP_RESPONSE_MSG) {	
+			if (pjsip_rxdata->msg_info.msg->type == PJSIP_RESPONSE_MSG) {
 				int msec = 0;
 				int msec_repl = pjsip_rxdata->pkt_info.timestamp.sec*1000 + pjsip_rxdata->pkt_info.timestamp.msec;
 				pj_time_val s = pjsip_rxdata->pkt_info.timestamp;
@@ -824,7 +824,7 @@ void Test::update_result() {
 			res = "PASS";
 			success=true;
 		}
-		
+
 		// JSON report
 		string jsonLocalUri = local_uri;
 		jsonify(&jsonLocalUri);
@@ -1064,6 +1064,7 @@ TestAccount* Config::createAccount(AccountConfig acc_cfg) {
 	}
 	LOG(logINFO) <<__FUNCTION__<<" rtp port range: "<<rtp_cfg.port<<"-"<<acc_cfg.mediaConfig.transportConfig.portRange;
 
+	acc_cfg.natConfig.contactUseSrcPort = PJ_FALSE;
 	if (!ip_cfg.bound_address.empty()) {
 		acc_cfg.mediaConfig.transportConfig.boundAddress = ip_cfg.bound_address;
 	}
