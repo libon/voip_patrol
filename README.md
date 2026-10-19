@@ -85,7 +85,15 @@ It is possible to test many scenarios that are not easy to test manually like a 
         "kbytes": 127,
         "loss": 0,
         "discard": 0,
-        "mos_lq": 4.5
+        "mos_lq": 4.5,
+        "level_peak": 81,
+        "level_avg": 24,
+        "voice_frames": 97,
+        "samples": 150,
+        "player_level_peak": 81,
+        "player_level_avg": 24,
+        "player_voice_frames": 97,
+        "player_samples": 150
       },
       "Rx": {
         "jitter_avg": 0,
@@ -94,17 +102,47 @@ It is possible to test many scenarios that are not easy to test manually like a 
         "kbytes": 127,
         "loss": 0,
         "discard": 0,
-        "mos_lq": 4.5
+        "mos_lq": 4.5,
+        "level_peak": 78,
+        "level_avg": 15,
+        "voice_frames": 71,
+        "samples": 150
       }
     }
   }
 }
 ```
 
+### Signal-level sampling
+
+Set `energy_stats="true"` on a `call` or `accept` action.
+
+| field | meaning |
+|---|---|
+| `level_peak` | maximum sampled level over the call (0..255) |
+| `level_avg` | arithmetic mean of all samples |
+| `voice_frames` | count of samples whose level exceeded the voice threshold (3) |
+| `samples` | total number of samples taken (~10 Hz × duration_sec) |
+
+| level  | approx dBov | typical signal |
+|-------:|------------:|----------------|
+| 0..3   |  < −70      | digital silence / mute (below the voice-frame threshold) |
+| 8      |     −64     | low-level comfort noise, breath |
+| 16     |     −56     | quiet room noise |
+| 32     |     −48     | distant / whispered speech |
+| 64     |     −39     | soft speech |
+| 96     |     −31     | quiet conversational voice |
+| 120    |     −26     | **ITU-T P.56 nominal active speech level** |
+| 128    |     −25     | normal conversational voice |
+| 160    |     −18     | loud / emphatic voice |
+| 192    |     −12     | shouting |
+| 224    |      −6     | near-clip / screaming into the handset |
+| 255    |       0     | digital full scale (clipping) |
+
 ### Example: starting a TLS server
 ```bash
 ./voip_patrol \
-   --port 5060 \ # TLS port 5061 +1
+   --port 5060 \ # TLS port is this +1 (i.e. 5061)
    --conf "xml/tls_server.xml" \
    --tls-calist "tls/ca_list.pem" \
    --tls-privkey "tls/key.pem" \
@@ -155,18 +193,18 @@ It is possible to test many scenarios that are not easy to test manually like a 
 <config>
   <actions>
     <action type="accept"
-            match_account="default"
+            account="default"
             hangup="5"
             code="200" reason="OK"
     >
         <check-header name="Min-SE"/>
-        <!-- Chech that a header exists -->
+        <!-- Check that a header exists -->
         <check-header name="X-Foo" value="Bar"/>
-        <!-- Chech that a header exists and have a specific value -->
+        <!-- Check that a header exists and have a specific value -->
         <check-header name="From" regex="^.*sip:\+1234@example\.com"/>
-        <!-- Chech that a header exists and matches a specific regex -->
+        <!-- Check that a header exists and matches a specific regex -->
         <check-header name="To" regex="^.*sip:\+5678@example\.com" fail_on_match="true"/>
-        <!-- Chech that a header exists and NOT matches a specific regex -->
+        <!-- Check that a header exists and NOT matches a specific regex -->
         <check-header name="RURI" regex="^INVITE\ sip:\d{5}@(\d{1,3}\.){3}\d{1,3}:\d{1,5};.*transport=[a-zA-Z]{3};.*"/>
         <!-- Not really a header, but allows to check the Request URI on an incoming INVITE-->
     </action>
@@ -253,7 +291,7 @@ DISCONNECTED
 ### Example: re-invite with new codec
 ```xml
 <config>
-    <action>
+    <actions>
         <action type="codec" disable="all"/>
         <action type="codec" enable="pcma" priority="250"/>
         <action type="codec" enable="pcmu" priority="248"/>
@@ -276,9 +314,9 @@ DISCONNECTED
         <action type="codec" enable="pcma" priority="250"/>
         <!-- re-invite will now use pcma forcing a new session -->
 
-        <action type="wait" complete="true"> <!-- Wait until the calls are disconnected -->
-    <actions/>
-<config/>
+        <action type="wait" complete="true"/> <!-- Wait until the calls are disconnected -->
+    </actions>
+</config>
 ```
 
 ### Example: Overwriting local contact header
@@ -306,6 +344,64 @@ DISCONNECTED
     </action>
     <action type="wait" complete="true" />
 </actions></config>
+```
+
+### Example: hangup on tone detection
+Detects US ringback (440Hz + 480Hz) during early media and hangs up as soon as
+the tone is observed for ~60ms. Useful to verify that a carrier returns
+ringback within a target PDD, without staying on the call after.
+
+```xml
+<config>
+  <actions>
+    <action type="call"
+            transport="udp"
+            caller="2012772903@us-east-va.sip.flowroute.com"
+            callee="5144496444@us-east-va.sip.flowroute.com"
+            username="VP_ENV_USERNAME"
+            password="VP_ENV_PASSWORD"
+            expected_cause_code="487"
+            max_duration="20"
+            hangup="15"
+            detect_tone="true"/>
+    <action type="wait" complete="true"/>
+  </actions>
+</config>
+```
+Result JSON gets:
+```json
+"tone_detected": 1,
+"tone_detected_ms": 120
+```
+where `tone_detected_ms` is the time from when audio came up (first early-media
+SDP) to detection. `expected_cause_code="487"` because the call is cancelled
+by voip_patrol once the tone fires, so the carrier returns *Request Terminated*.
+
+#### Detect without hanging up
+Add `hangup_on_tone="false"` to keep the call running to its normal end while
+still recording the detection in the result JSON.
+
+```xml
+<action type="call"
+        ...
+        hangup="20"
+        detect_tone="true"
+        hangup_on_tone="false"/>
+```
+
+#### Detecting other call-progress tones
+The `tones` attribute takes a comma-separated list of frequencies (Hz) that
+must all be present at once. Up to 4 simultaneous frequencies are supported.
+
+```xml
+<!-- US dial tone (350 + 440 Hz) -->
+<action type="call" ... detect_tone="true" tones="350,440"/>
+
+<!-- US busy / reorder (480 + 620 Hz) -->
+<action type="call" ... detect_tone="true" tones="480,620"/>
+
+<!-- 1004 Hz milliwatt test tone (single frequency) -->
+<action type="call" ... detect_tone="true" tones="1004"/>
 ```
 
 ### Example: WAIT action
@@ -401,17 +497,30 @@ DISCONNECTED
 | early_media | bool | if "true" 183 with SDP and early media is used |
 | timer | string | control SIP session timers, possible values are : inactive, optional, required or always |
 | code | int | SIP cause code to return must be >100 and <700 |
+| reason | string | SIP reason phrase for the response |
 | account | string | Account will be used if it matches the user part of an incoming call RURI or "default" will catch all |
 | response_delay | int | ms delay before reponse is sent, useful to test timeouts and race conditions |
 | call_count | int | The amount of calls to receive to consider the command completed, default -1 (considered completed) |
 | transport | string | Force a specific transport for all messages on accepted calls, default to all transport available |
+| max_duration | int | max call duration in seconds (test failure if exceeded) |
+| wait_until | string | call state to wait for before unblocking <NULL,CALLING,INCOMING,EARLY,CONNECTING,CONFIRMED,DISCONNECTED> |
 | re_invite_interval | int | Interval in seconds at which a re-invite with SDP will be sent |
+| min_mos | float | minimum acceptable MOS score for the call to PASS |
 | rtp_stats | bool | if "true" the json report will include a report on RTP transmission |
+| energy_stats | bool | if "true" the json report will include a signal level stats |
 | srtp | string | Comma-separated values of the following "sdes" - add SDES support, "dtls" - add DTLS-SRTP support, "force" - make SRTP mandatory |
+| late_start | bool | if "true" no SDP will be included in the 200 OK and will result in a late offer in ACK |
 | hangup | int | call duration in second before hangup |
+| force_contact | string | local contact header will be overwritten by the given string |
 | label | string | test description or label |
-| record | bool | if "true" the call will be recorded once connected in /voice_files |
-| record_early | bool | if "true" the call will be recorded when early media starts in /voice_files. If call is answered after, recording will continue in the same file |
+| play | string | path to a wav file to play once the call is connected |
+| record | bool | if "true" the call will be recorded once connected, written under the directory passed via `--record-dir` (default `/voice_files/`) |
+| record_tx | bool | if "true" the audio sent to the far end is also recorded once connected, to `record_<call-id>_<contact>_tx.wav` next to the inbound `..._rec.wav`: the `play` file, or the default `voice_ref_files/reference_8000.wav` when `play` is not set |
+| record_early | bool | if "true" the call will be recorded when early media starts, written under `--record-dir`. If call is answered after, recording will continue in the same file |
+| detect_tone | bool | if "true" a tone detector is wired to the call during early media. Detection is reported in the result JSON as `tone_detected` and `tone_detected_ms` |
+| tones | string | comma-separated frequencies (Hz) the detector must observe simultaneously (AND), max 4. Defaults to `440,480` (US ringback) when `detect_tone="true"` |
+| hangup_on_tone | bool | if "true" (default) the call is hung up once the tone is detected; set to "false" to keep the call running and only record the detection in the result JSON |
+| play_dtmf | string | list of DTMF symbols to be sent upon answer. Supports [Asterisk](https://docs.asterisk.org/Latest_API/API_Documentation/Dialplan_Applications/SendDTMF/#arguments)-like syntax, namely `w` for a half second pause, `W` for a one second pause |
 
 ### call command parameters
 
@@ -419,23 +528,38 @@ DISCONNECTED
 | ---- | ---- | ----------- |
 | timer | string | control SIP session timers, possible values are : inactive, optional, required or always |
 | proxy | string | ip/hostname of a proxy where to send the call |
-| caller | string | From header user@host, only used if from it not specified |
+| caller | string | From header user@host, only used if from is not specified |
+| from | string | overrides caller for the From header user@host |
 | display_name | string | From and Contact header display name, example: "Alice" |
 | callee | string | request URI user@host (also used in the To header unless to_uri is specified) |
-| to_uri | string | used@host part of the URI in the To header |
+| to_uri | string | user@host part of the URI in the To header |
 | transport | string | force a specific transport <tcp,udp,tls,sips,tcp6,udp6,tls6,sips6> |
+| expected_cause_code | int | expected SIP response code, defaults to 200 |
+| wait_until | string | call state to wait for before unblocking <NULL,CALLING,INCOMING,EARLY,CONNECTING,CONFIRMED,DISCONNECTED> |
+| max_duration | int | max call duration in seconds (test failure if exceeded) |
+| max_ringing_duration | int | max ringing duration in seconds before cancel, default 60 |
+| min_mos | float | minimum acceptable MOS score for the call to PASS |
 | re_invite_interval | int | Interval in seconds at which a re-invite with SDP will be sent |
 | rtp_stats | bool | if "true" the json report will include a report on RTP transmission |
+| energy_stats | bool | if "true" the json report will include a signal level stats |
 | srtp | string | Comma-separated values of the following "sdes" - add SDES support, "dtls" - add DTLS-SRTP support, "force" - make SRTP mandatory. Note, if you don't specify "force", call would be made with plain RTP. If you specify both "sdes" and "dtls", DTLS-SRTP would be used regardless of order. |
 | late_start | bool | if "true" no SDP will be included in the INVITE and will result in a late offer in 200 OK/ACK |
-| record | bool | if "true" the call will be recorded once connected in /voice_files |
-| record_early | bool | if "true" the call will be recorded when early media starts in /voice_files. If call is answered after, recording will continue in the same file |
+| record | bool | if "true" the call will be recorded once connected, written under the directory passed via `--record-dir` (default `/voice_files/`) |
+| record_tx | bool | if "true" the audio sent to the far end is also recorded once connected, to `record_<call-id>_<contact>_tx.wav` next to the inbound `..._rec.wav`: the `play` file, or the default `voice_ref_files/reference_8000.wav` when `play` is not set |
+| record_early | bool | if "true" the call will be recorded when early media starts, written under `--record-dir`. If call is answered after, recording will continue in the same file |
+| detect_tone | bool | if "true" a tone detector is wired to the call during early media. Detection is reported in the result JSON as `tone_detected` and `tone_detected_ms` |
+| tones | string | comma-separated frequencies (Hz) the detector must observe simultaneously (AND), max 4. Defaults to `440,480` (US ringback) when `detect_tone="true"` |
+| hangup_on_tone | bool | if "true" (default) the call is hung up once the tone is detected; set to "false" to keep the call running and only record the detection in the result JSON |
+| play | string | path to a wav file to play once the call is connected |
+| play_dtmf | string | list of DTMF symbols to be sent upon answer. Supports [Asterisk](https://docs.asterisk.org/Latest_API/API_Documentation/Dialplan_Applications/SendDTMF/#arguments)-like syntax, namely `w` for a half second pause, `W` for a one second pause |
 | force_contact | string | local contact header will be overwritten by the given string |
-| max_ringing_duration | int | max ringing duration in seconds before cancel, default 60 |
+| early_cancel | int | ms after early media when a CANCEL is sent |
 | hangup | int | call duration in second before hangup |
 | repeat | int | do this call multiple times |
+| repeat_interval | int | ms to sleep between calls when `repeat` > 0, to avoid flooding the remote peer. Default 0 (no spacing). |
 | username | string | authentication username, account name, From/To/Contact header user part |
 | password | string | authentication password |
+| realm | string | authentication realm, defaults to "*" |
 | label | string | test description or label |
 
 ### register command parameters
@@ -445,7 +569,8 @@ DISCONNECTED
 | proxy | string | ip/hostname of a proxy where to send the register |
 | username | string | authentication username, account name, From/To/Contact header user part |
 | password | string | authentication password |
-| account | string | if not specified username is used, this is the the account name and From/To/Contact header user part |
+| realm | string | authentication realm, defaults to "*" |
+| account | string | if not specified username is used, this is the account name and From/To/Contact header user part |
 | registrar | string | SIP UAS handling registration where the messages will be sent |
 | transport | string | force a specific transport <tcp,udp,tls,sips> |
 | unregister | bool | unregister the account <usename@registrar;transport=x> |
@@ -453,24 +578,21 @@ DISCONNECTED
 | instance_id | int | same as reg_id, if not present, it will be generated automatically |
 | rewrite_contact | bool | default true, detect public IP when registering and rewrite the contact header |
 | srtp | string | Comma-separated values of the following "sdes" - add SDES support, "dtls" - add DTLS-SRTP support, "force" - make SRTP mandatory. Used for incoming calls to this account |
-| account | string | if not specified username is used, this is the the account name and From/To/Contact header user part |
-| registrar | string | SIP UAS handling registration where the messages will be sent |
-| transport | string | force a specific transport <tcp,udp,tls,sips> |
-| unregister | bool | unregister the account <usename@registrar;transport=x> |
-| reg_id | int | if present outbound and other related parameters will be added see RFC5626 |
-| instance_id | int | same as reg_id, if not present, it will be generated automatically |
-| rewrite_contact | bool | default true, detect public IP when registering and rewrite the contact header |
-| srtp | string | Comma-separated values of the following "sdes" - add SDES support, "dtls" - add DTLS-SRTP support, "force" - make SRTP mandatory. Used for incoming calls to this account |
+| expected_cause_code | int | expected SIP response code, defaults to 200 |
+| label | string | test description or label |
 
 ### message command parameters
 
 | Name | Type | Description |
 | ---- | ---- | ----------- |
 | from | string | From header complete "\&quot;Display Name\&quot; <sip:test at 127.0.0.1>"  |
-| to_uri | string | used@host part of the URI in the To header |
+| to_uri | string | user@host part of the URI in the To header |
+| text | string | message body to send |
 | transport | string | force a specific transport <tcp,udp,tls,sips> |
 | username | string | authentication username, account name, From/To/Contact header user part |
 | password | string | authentication password |
+| realm | string | authentication realm, defaults to "*" |
+| expected_cause_code | int | expected SIP response code, defaults to 200 |
 | label | string | test description or label |
 
 ### Example: sending a message
@@ -567,10 +689,10 @@ DISCONNECTED
 | server | string | turn server URI or IP:port |
 | username | string | turn server username |
 | password | string | turn server password |
-| password_hashed | bool | if "true" us hashed password, default plain password |
-| sip_stun_use | bool | if "true" SIP reflective IP is use with signaling |
-| media_stun_use | bool | if "true" STUN reflective IP is use with media/SDP |
-| stun_only | bool | if "true" TURN and ICE are disabled and only STUN is use |
+| password_hashed | bool | if "true" use hashed password, default plain password |
+| sip_stun_use | bool | if "true" SIP reflective IP is used with signaling |
+| media_stun_use | bool | if "true" STUN reflective IP is used with media/SDP |
+| stun_only | bool | if "true" TURN and ICE are disabled and only STUN is used |
 
 ### using multiple accounts
 When using multiple accounts, accounts can be created and selected with the following parameters.
@@ -584,7 +706,7 @@ When using multiple accounts, accounts can be created and selected with the foll
 | message | from |
 
 ### using env variable in scenario actions parameters
-Any value starting with `VP_ENV` will be replaced by the envrironment variable of the same name.
+Any value starting with `VP_ENV` will be replaced by the environment variable of the same name.
 Example : `username="VP_ENV_USERNAME"`
 ```bash
 export VP_ENV_PASSWORD=????????

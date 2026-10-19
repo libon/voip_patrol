@@ -17,6 +17,11 @@
  */
 
 #include "voip_patrol.hh"
+#include <pjmedia/null_port.h>
+
+// Forward declarations for meter sink.
+static void attach_meter_sink(TestCall *call, pjsua_call_id call_id);
+static void detach_meter_sink(TestCall *call);
 #include "mod_voip_patrol.hh"
 #include "action.hh"
 #include "check.hh"
@@ -91,6 +96,35 @@ bool stob(std::string s) {
     return result;
 }
 
+// Translating string like '123ww45' -> send 123, 2 times pause 0.5s, send 45
+static std::vector<Test::DtmfSequenceItem> parseDtmfSequence(const std::string &input) {
+	std::vector<Test::DtmfSequenceItem> seq;
+	std::string buf;
+
+	int delay_ms = 0;
+	for (char c : input) {
+		if (c == 'w') {
+			if (!buf.empty()) {
+				seq.push_back({delay_ms, buf});
+				buf.clear();
+			}
+			delay_ms += 500;
+		} else if (c == 'W') {
+			if (!buf.empty()) {
+				seq.push_back({delay_ms, buf});
+				buf.clear();
+			}
+			delay_ms += 1000;
+		} else {
+			buf += c;
+		}
+	}
+	if (!buf.empty()) {
+		seq.push_back({delay_ms, buf});
+	}
+	return seq;
+}
+
 static pj_status_t stream_to_call(TestCall* call, pjsua_call_id call_id, const char *caller_contact ) {
 	pj_status_t status = PJ_SUCCESS;
 	// Create a player if none.
@@ -105,10 +139,66 @@ static pj_status_t stream_to_call(TestCall* call, pjsua_call_id call_id, const c
 			return status;
 		}
 	}
+	int player_conf_port = pjsua_player_get_conf_port(call->player_id);
+	int call_conf_port = pjsua_call_get_conf_port(call_id);
+	if (player_conf_port < 0 || call_conf_port < 0) {
+		LOG(logINFO) <<__FUNCTION__<<": [error] invalid conf port player["<<player_conf_port<<"] call["<<call_conf_port<<"]";
+		return PJ_EINVAL;
+	}
 	LOG(logINFO) <<__FUNCTION__<<": connecting player_id["<<call->player_id<<"]";
-	status = pjsua_conf_connect(pjsua_player_get_conf_port(call->player_id), pjsua_call_get_conf_port(call_id));
+	status = pjsua_conf_connect(player_conf_port, call_conf_port);
 	LOG(logINFO) <<__FUNCTION__<<": player connected";
 	return status;
+}
+
+void tone_detected(pjmedia_port *port, void *user_data,
+                   const pjmedia_tone_detect_event *event) {
+	PJ_UNUSED_ARG(port);
+	TestCall* call = (TestCall *)user_data;
+	if (!call->test) {
+		LOG(logINFO) <<__FUNCTION__<<": tone detected but no test attached";
+		return;
+	}
+	call->test->tone_detected_ms = event ? event->duration_ms : 0;
+	call->test->tone_detected = true;
+	LOG(logINFO) <<__FUNCTION__<<": tone detected after "
+	             << call->test->tone_detected_ms <<"ms, test flagged for hangup";
+	/* Hangup runs from do_wait on the main thread; this callback is on a
+	 * pjmedia event thread, so we only flip the flag. */
+}
+
+static pj_status_t start_tone_detector(TestCall* call, pjsua_call_id call_id) {
+	/* Idempotent: onCallMediaState can fire multiple times during early
+	 * media (codec change, re-INVITE). The detector is created and wired
+	 * to the conf bridge exactly once. */
+	if (call->tone_detector_id >= 0) {
+		return PJ_SUCCESS;
+	}
+
+	const std::vector<unsigned> &tones = call->test->tones;
+	if (tones.empty() || tones.size() > PJMEDIA_TONE_DETECT_MAX_FREQS) {
+		LOG(logERROR) <<__FUNCTION__<<": invalid tones list size:"<< tones.size();
+		return PJ_EINVAL;
+	}
+
+	pj_status_t status = pjsua_tone_detector_create(&tone_detected, call,
+	                                                tones.data(),
+	                                                (unsigned)tones.size(),
+	                                                &call->tone_detector_id);
+	if (status != PJ_SUCCESS) {
+		LOG(logINFO) <<__FUNCTION__<<": [error] tone_detector_create failed status:"<< status;
+		return status;
+	}
+	LOG(logINFO) <<__FUNCTION__<<": [tone_detector] created id:"<< call->tone_detector_id
+	             <<" watching "<< tones.size() <<" freq(s)";
+
+	int call_conf_port = pjsua_call_get_conf_port(call_id);
+	if (call_conf_port == PJSUA_INVALID_ID) {
+		LOG(logINFO) <<__FUNCTION__<<": [tone_detector] no conf port for call yet";
+		return PJ_EBUSY;
+	}
+	return pjsua_conf_connect(call_conf_port,
+	                          pjsua_recorder_get_conf_port(call->tone_detector_id));
 }
 
 static pj_status_t record_call(const char *prefix, TestCall* call, pjsua_call_id call_id, const char *caller_contact) {
@@ -117,7 +207,7 @@ static pj_status_t record_call(const char *prefix, TestCall* call, pjsua_call_id
 	if (call->recorder_id < 0) {
 		char rec_fn[1024] = "";
 		CallInfo ci = call->getInfo();
-		sprintf(rec_fn,"/voice_files/%s%s_%s_rec.wav", prefix, ci.callIdString.c_str(), caller_contact);
+		sprintf(rec_fn,"%s%s%s_%s_rec.wav", call->test->config->record_dir.c_str(), prefix, ci.callIdString.c_str(), caller_contact);
 		call->test->record_fn = string(&rec_fn[0]);
 		const pj_str_t rec_file_name = pj_str(rec_fn);
 		status = pjsua_recorder_create(&rec_file_name, 0, NULL, -1, 0, &call->recorder_id);
@@ -133,6 +223,36 @@ static pj_status_t record_call(const char *prefix, TestCall* call, pjsua_call_id
 		return PJ_FALSE;
 	}
 	status = pjsua_conf_connect(pjsua_call_get_conf_port(call_id), pjsua_recorder_get_conf_port(call->recorder_id));
+	return status;
+}
+
+// record_tx_call records what we send: the player feeds the call, so a second recorder
+// on the player's conf port captures our outbound audio, kept apart from the inbound file.
+static pj_status_t record_tx_call(const char *prefix, TestCall* call, const char *caller_contact) {
+	if (call->player_id < 0) {
+		LOG(logWARNING) <<__FUNCTION__<<": [tx recorder] no player (the play file could not be opened), nothing to record";
+		return PJ_EINVAL;
+	}
+	pj_status_t status = PJ_SUCCESS;
+	if (call->tx_recorder_id < 0) {
+		char rec_fn[1024] = "";
+		CallInfo ci = call->getInfo();
+		snprintf(rec_fn, sizeof(rec_fn), "%s%s%s_%s_tx.wav", call->test->config->record_dir.c_str(), prefix, ci.callIdString.c_str(), caller_contact);
+		const pj_str_t rec_file_name = pj_str(rec_fn);
+		status = pjsua_recorder_create(&rec_file_name, 0, NULL, -1, 0, &call->tx_recorder_id);
+		if (status != PJ_SUCCESS) {
+			LOG(logINFO) <<__FUNCTION__<<": [error] tx recorder create";
+			return status;
+		}
+		LOG(logINFO) <<__FUNCTION__<<": [tx recorder] >> created:" << call->tx_recorder_id << " fn:"<< rec_fn;
+	}
+	status = pjsua_conf_connect(pjsua_player_get_conf_port(call->player_id), pjsua_recorder_get_conf_port(call->tx_recorder_id));
+	if (status != PJ_SUCCESS) {
+		// Unconnected, it would only hold a conf slot and record silence.
+		LOG(logWARNING) <<__FUNCTION__<<": [tx recorder] connect failed: " << status;
+		pjsua_recorder_destroy(call->tx_recorder_id);
+		call->tx_recorder_id = -1;
+	}
 	return status;
 }
 
@@ -169,12 +289,12 @@ public:
 };
 
 vp_call_param::vp_call_param(const SipTxOption &tx_option) {
-	if (tx_option.isEmpty()) {
-		p_msg_data = NULL;
-	} else {
+	pjsua_msg_data_init(&msg_data);
+	if (!tx_option.isEmpty()) {
 		tx_option.toPj(msg_data);
 		p_msg_data = &msg_data;
 	}
+	p_msg_data = &msg_data;
 	p_opt = NULL;
 	p_reason = NULL;
 	sdp = NULL;
@@ -183,19 +303,17 @@ vp_call_param::vp_call_param(const SipTxOption &tx_option) {
 vp_call_param::vp_call_param(const SipTxOption &tx_option, const CallSetting &setting,
                        const string &reason_str, pj_pool_t *pool,
                        const string &sdp_str) {
-	if (tx_option.isEmpty()) {
-		p_msg_data = NULL;
-	} else {
+	pjsua_msg_data_init(&msg_data);
+	if (!tx_option.isEmpty()) {
 		tx_option.toPj(msg_data);
-		p_msg_data = &msg_data;
 	}
+	p_msg_data = &msg_data;
 
-	if (setting.isEmpty()) {
-		p_opt = NULL;
-	} else {
+	pjsua_call_setting_default(&opt);
+	if (!setting.isEmpty()) {
 		opt = setting.toPj();
-		p_opt = &opt;
 	}
+	p_opt = &opt;
 	reason = str2Pj(reason_str);
 	p_reason = (reason.slen == 0? NULL: &reason);
 
@@ -217,9 +335,32 @@ vp_call_param::vp_call_param(const SipTxOption &tx_option, const CallSetting &se
 }
 
 void TestCall::hangup(const CallOpParam &prm) {
-		if (disconnecting) return;
+		CallInfo ci = getInfo();
+		LOG(logINFO) <<__FUNCTION__<<" CALLED: state="<<ci.state<<" stateText="<<ci.stateText<<" disconnecting="<<disconnecting;
+		if (disconnecting) {
+			LOG(logINFO) <<__FUNCTION__<<" SKIP: already disconnecting";
+			return;
+		}
 		disconnecting = true;
-		LOG(logINFO) <<__FUNCTION__<<": [hangup]";
+		LOG(logINFO) <<__FUNCTION__<<": [hangup] disconnecting set to true";
+
+		// Cleanup player and recorder
+		if (player_id != -1) {
+			LOG(logINFO) <<__FUNCTION__<<" destroying player_id="<<player_id;
+			pjsua_player_destroy(player_id);
+			player_id = -1;
+		}
+		if (recorder_id != -1) {
+			LOG(logINFO) <<__FUNCTION__<<" destroying recorder_id="<<recorder_id;
+			pjsua_recorder_destroy(recorder_id);
+			recorder_id = -1;
+		}
+		if (tx_recorder_id != -1) {
+			pjsua_recorder_destroy(tx_recorder_id);
+			tx_recorder_id = -1;
+		}
+		detach_meter_sink(this);
+
 		Call::hangup(prm);
 }
 
@@ -252,17 +393,25 @@ TestCall::TestCall(TestAccount *p_acc, int call_id) : Call(*p_acc, call_id) {
 	test = NULL;
 	acc = p_acc;
 	recorder_id = -1;
+	tx_recorder_id = -1;
+	tone_detector_id = -1;
 	player_id = -1;
+	durationBeforeEarly = 0;
 	role = -1; // Caller 0 | callee 1
 	disconnecting = false;
 }
 
 TestCall::~TestCall() {
 	if (test) {
-		test->config->checking_calls.lock();
-		test->config->removeCall(this);
+		/* Cache config before delete: unlocking through test->config after
+		 * delete test is a use-after-free. Also skip removeCall from here —
+		 * ~TestCall is invoked *from* Config::removeCall (line 1263), so
+		 * calling it again would try to erase an already-erased entry, and
+		 * more importantly would re-enter delete-this recursively. */
+		Config *cfg = test->config;
+		std::lock_guard<std::mutex> lg(cfg->checking_calls);
 		delete test;
-		test->config->checking_calls.unlock();
+		test = nullptr;
 	}
 }
 
@@ -283,12 +432,19 @@ void TestCall::onCallTsxState(OnCallTsxStateParam &prm) {
 	if (prm.e.type == PJSIP_EVENT_TSX_STATE && prm.e.body.tsxState.type == PJSIP_EVENT_RX_MSG) {
 		pjsip_rx_data *pjsip_rxdata = (pjsip_rx_data *) prm.e.body.tsxState.src.rdata.pjRxData;
 		if (pjsip_rxdata) {
-			if (pjsip_rxdata->msg_info.msg->type == PJSIP_RESPONSE_MSG) {	
+			if (pjsip_rxdata->msg_info.msg->type == PJSIP_RESPONSE_MSG) {
 				int msec = 0;
 				int msec_repl = pjsip_rxdata->pkt_info.timestamp.sec*1000 + pjsip_rxdata->pkt_info.timestamp.msec;
 				pj_time_val s = pjsip_rxdata->pkt_info.timestamp;
 
-				PJ_TIME_VAL_SUB(s, test->sip_latency.inviteSentTs);
+				// Only calculate latency if inviteSentTs was initialized (outgoing calls)
+				if (test->sip_latency.inviteSentTs.sec > 0 && test->sip_latency.inviteSentTs.sec < 2000000000) {
+					PJ_TIME_VAL_SUB(s, test->sip_latency.inviteSentTs);
+				} else {
+					// For incoming calls, set s to zero to skip latency measurements
+					s.sec = 0;
+					s.msec = 0;
+				}
 				if (ci.state == PJSIP_INV_STATE_CALLING && test->sip_latency.invite100Ms == 0) {
 					test->sip_latency.invite100Ms = s.sec*1000+s.msec;
 				} else if (ci.state == PJSIP_INV_STATE_EARLY && test->sip_latency.invite18xMs == 0) {
@@ -305,6 +461,11 @@ void TestCall::onCallTsxState(OnCallTsxStateParam &prm) {
 						this->hangup(prm);
 						LOG(logINFO) <<__FUNCTION__<<" DISCONNECTING: EARLY CANCEL CONNECTED:"<<pjsip_rxdata->msg_info.msg->line.status.code;
 					}
+				//	if (test->hangup_duration == 0) {
+				//		CallOpParam prm(true);
+				//		this->hangup(prm);
+				//		LOG(logINFO) <<__FUNCTION__<<" DISCONNECTING: MAX DURATION is set to 0: "<<pjsip_rxdata->msg_info.msg->line.status.code;
+				//	}
 //				} else if (ci.state == PJSIP_INV_STATE_DISCONNECTED && test->sip_latency.bye200Ms == 0) {
 //					PJ_TIME_VAL_SUB(s, test->sip_latency.byeSentTs);
 //					PJ_TIME_VAL_SUB(pjsip_rxdata->pkt_info.timestamp, s);
@@ -322,17 +483,180 @@ void TestCall::onCallTsxState(OnCallTsxStateParam &prm) {
 	}
 }
 
-/* Convenient function to convert transmission factor to MOS */
+/* Convert an R-factor (0-100) to MOS using the ITU-T G.107 nonlinear
+ * mapping: MOS = 1 + 0.035*R + R*(R-60)*(100-R)*7e-6. Clamped to [1.0, 4.5].
+ *
+ * The previous implementation used a linear mapping (R*4.5/100), which
+ * matched the curve only at the extremes and underreported MOS by up to
+ * ~0.43 in the middle of the range — most visibly, clean PCMU calls
+ * (R≈93) read as 4.18 instead of the industry-standard 4.41. */
 static float rfactor_to_mos(float rfactor) {
-	float mos;
-	if (rfactor <= 0) {
-		mos = 0.0;
-	} else if (rfactor > 100) {
-		mos = 4.5;
-	} else {
-		mos = rfactor*4.5/100;
+	if (rfactor <= 0)
+		return 1.0f;
+	if (rfactor >= 100)
+		return 4.5f;
+	const float R = rfactor;
+	return 1.0f + 0.035f * R + R * (R - 60.0f) * (100.0f - R) * 7.0e-6f;
+}
+
+/* G.107 E-model per-codec values used in Ie_eff = Ie + (95-Ie)*Ppl /
+ * (Ppl/BurstR + Bpl).
+ *
+ * Narrowband codecs (G.729, iLBC, AMR-NB, GSM) use ITU-T G.113 Annex I
+ * values directly — the model was calibrated against this codec class so
+ * the numbers are honest.
+ *
+ * Wideband codecs (G.722, G.722.1, G.722.2/AMR-WB, Opus) are pinned to
+ * G.711-class values. The G.107 model penalises wideband codecs for
+ * being lossy compressors but gives them no credit for the extra
+ * bandwidth, so the standard values would make Opus and G.722 score
+ * worse than PCMU on a clean call — the opposite of what listeners hear.
+ * We treat wideband codecs as at-least equivalent to G.711.
+ *
+ * Opus additionally gets a slightly higher Bpl to credit better PLC
+ * and the possibility of in-band FEC, without assuming FEC is always
+ * active or always effective (single-packet FEC is defeated by bursty
+ * loss). With FEC reliably on, real Bpl is closer to 35-40, so this
+ * errs conservative. */
+struct codec_emodel {
+	const char *name;   /* pjmedia codec encoding name (case-insensitive prefix match) */
+	float Ie;           /* intrinsic codec impairment */
+	float Bpl;          /* packet-loss robustness */
+};
+
+static const codec_emodel CODEC_EMODELS[] = {
+	{ "PCMU",   0.0f, 25.1f },
+	{ "PCMA",   0.0f, 25.1f },
+	{ "G722",   0.0f, 25.1f },   /* wideband, pinned to G.711 (see comment above) */
+	{ "G7221",  0.0f, 25.1f },   /* G.722.1, same */
+	{ "G7222",  0.0f, 25.1f },   /* G.722.2 / AMR-WB, same */
+	{ "G729",  11.0f, 19.0f },
+	{ "iLBC",  11.0f, 11.7f },
+	{ "AMR",    5.0f, 10.0f },   /* AMR-NB 12.2 kbps */
+	{ "GSM",   20.0f, 10.0f },
+	{ "opus",   0.0f, 28.0f },   /* SILK 16kHz wideband speech; modest FEC credit */
+};
+
+/* Case-insensitive prefix lookup so things like "opus/48000/2" still match
+ * "opus". Falls back to G.711 values for unknown codecs. */
+static codec_emodel emodel_for_codec(const std::string &codec_name) {
+	for (size_t i = 0; i < sizeof(CODEC_EMODELS)/sizeof(CODEC_EMODELS[0]); ++i) {
+		const codec_emodel &c = CODEC_EMODELS[i];
+		if (pj_ansi_strnicmp(codec_name.c_str(), c.name,
+		                     (pj_ssize_t)strlen(c.name)) == 0) {
+			return c;
+		}
 	}
-	return mos;
+	LOG(logWARNING) << "emodel_for_codec: unknown codec '" << codec_name
+	                << "', falling back to G.711 (Ie=0, Bpl=25.1)";
+	return { "G711-fallback", 0.0f, 25.1f };
+}
+
+/* Create a null sink port and connect the call -> null, so pjmedia's
+ * port->bridge signal-level meter on the call conf port stays populated.
+ * Called at CONFIRMED time only when the test has no recorder and no
+ * tone detector; otherwise those already consume the port. */
+static void attach_meter_sink(TestCall *call, pjsua_call_id call_id) {
+	if (!call || call->meter_sink_slot != PJSUA_INVALID_ID) return;
+	if (!call->test || !call->test->energy_stats) return;
+	if (call->test->record || call->test->detect_tone) return;
+
+	pj_pool_t *pool = pjsua_pool_create("vp-meter", 512, 512);
+	if (!pool) return;
+
+	pjmedia_port *port = nullptr;
+	pj_status_t status = pjmedia_null_port_create(pool, 8000, 1, 160, 16, &port);
+	if (status != PJ_SUCCESS) {
+		pj_pool_release(pool);
+		return;
+	}
+
+	pjsua_conf_port_id slot = PJSUA_INVALID_ID;
+	status = pjsua_conf_add_port(pool, port, &slot);
+	if (status != PJ_SUCCESS) {
+		pj_pool_release(pool);
+		return;
+	}
+
+	status = pjsua_conf_connect(pjsua_call_get_conf_port(call_id), slot);
+	if (status != PJ_SUCCESS) {
+		pjsua_conf_remove_port(slot);
+		pj_pool_release(pool);
+		return;
+	}
+
+	call->meter_sink_port = port;
+	call->meter_sink_pool = pool;
+	call->meter_sink_slot = slot;
+	LOG(logINFO) <<"attach_meter_sink: slot="<< slot;
+}
+
+static void detach_meter_sink(TestCall *call) {
+	if (!call || call->meter_sink_slot == PJSUA_INVALID_ID) return;
+	pjsua_conf_remove_port(call->meter_sink_slot);
+	call->meter_sink_slot = PJSUA_INVALID_ID;
+	call->meter_sink_port = nullptr;
+	if (call->meter_sink_pool) {
+		pj_pool_release(call->meter_sink_pool);
+		call->meter_sink_pool = nullptr;
+	}
+}
+
+/* Sample the call's conf-port signal levels on a CONFIRMED call and
+ * fold the values into Test counters. Called from do_wait's 100 ms
+ * status tick: the underlying tx_level/rx_level fields in pjmedia are
+ * overwritten every bridge frame (~20 ms), so a single read at
+ * stream-destroy would be meaningless. We under-sample by design;
+ * 100 ms is still fast enough to catch any sub-second speech burst,
+ * and it's cheap (just a mutexed field read in pjmedia). */
+void sample_signal_levels(TestCall *call) {
+	if (!call || !call->test) return;
+	Test *test = call->test;
+
+	/* Use the raw pjsua C API on the call conference port directly.
+	 * pjsua2's AudioMedia::getRxLevel/getTxLevel wrap the same call but
+	 * flip the naming in a confusing way; bypassing them keeps the
+	 * TX/RX direction unambiguous and avoids a getAudioMedia() lookup
+	 * that can throw during media-state transitions.
+	 *
+	 * On a call conf port:
+	 *   tx_level (bridge -> port) = audio about to be encoded for outbound RTP
+	 *   rx_level (port -> bridge) = audio decoded from inbound RTP
+	 */
+	pjsua_call_id cid = call->getId();
+	if (cid == PJSUA_INVALID_ID) return;
+	pjsua_conf_port_id slot = pjsua_call_get_conf_port(cid);
+	if (slot != PJSUA_INVALID_ID) {
+		unsigned tx = 0, rx = 0;
+		if (pjsua_conf_get_signal_level(slot, &tx, &rx) == PJ_SUCCESS) {
+			if (tx > test->tx_level_peak) test->tx_level_peak = tx;
+			if (rx > test->rx_level_peak) test->rx_level_peak = rx;
+			test->tx_level_sum += tx;
+			test->rx_level_sum += rx;
+			test->tx_level_samples++;
+			test->rx_level_samples++;
+			if (tx > VOICE_LEVEL_THRESHOLD) test->tx_voice_frames++;
+			if (rx > VOICE_LEVEL_THRESHOLD) test->rx_voice_frames++;
+		}
+	}
+
+	/* Also sample the player port when one is attached. The player is a
+	 * source into the bridge, so only its rx_level (port->bridge) is
+	 * meaningful; that is the outbound audio about to be mixed into the
+	 * call. Uses the raw pjsua C API because voip_patrol tracks
+	 * player_id as pjsua_player_id, not pjsua2::AudioMediaPlayer. */
+	if (call->player_id >= 0) {
+		pjsua_conf_port_id pslot = pjsua_player_get_conf_port(call->player_id);
+		if (pslot != PJSUA_INVALID_ID) {
+			unsigned level = 0;
+			if (pjsua_conf_get_signal_level(pslot, NULL, &level) == PJ_SUCCESS) {
+				if (level > test->tx_player_level_peak) test->tx_player_level_peak = level;
+				test->tx_player_level_sum += level;
+				test->tx_player_level_samples++;
+				if (level > VOICE_LEVEL_THRESHOLD) test->tx_player_voice_frames++;
+			}
+		}
+	}
 }
 
 void TestCall::onDtmfDigit(OnDtmfDigitParam &prm) {
@@ -342,11 +666,10 @@ void TestCall::onDtmfDigit(OnDtmfDigitParam &prm) {
 
 void TestCall::onCallMediaState(OnCallMediaStateParam &prm) {
 	CallInfo ci = getInfo();
-	LOG(logINFO) <<__FUNCTION__<<" id:"<<ci.id <<" record_early:"<< test->record_early;
-	if (test && ci.state == PJSIP_INV_STATE_EARLY && test->record_early && !test->is_recording_running) {
-		if (record_call("early_", this, ci.id, test->remote_user.c_str()) == PJ_SUCCESS) {
-			test->is_recording_running = true;
-		}
+	LOG(logINFO) <<__FUNCTION__<<" id:"<<ci.id <<" record_early:"<< test->record_early
+	             <<" detect_tone:"<< test->detect_tone;
+	if (test && ci.state == PJSIP_INV_STATE_EARLY && test->detect_tone) {
+		start_tone_detector(this, ci.id);
 	}
 }
 
@@ -382,10 +705,15 @@ void TestCall::onStreamDestroyed(OnStreamDestroyedParam &prm) {
 
 		// MOS-LQ - Listening Quality
 		/* represent loss dependent effective equipment impairment factor and percentage loss probability */
-		const int Bpl = 25; /* packet-loss robustness factor Bpl is defined as a codec-specific value. */
-		float Ie_eff_rx, Ppl_rx, Ppl_cut_rx, Ie_eff_tx, Ppl_tx, Ppl_cut_tx;
-		const int Ie = 0; /* Not used : Refer to Appendix I of [ITU-T G.113] for the currently recommended values of Ie.*/
+		const codec_emodel em = emodel_for_codec(infos.codecName);
+		const float Ie = em.Ie;
+		const float Bpl = em.Bpl;
+		float Ie_eff_rx, Ppl_rx, Ie_eff_tx, Ppl_tx;
 		float Ta = 0.0; /* Absolute Delay */
+		/* pjmedia's RtcpStreamStat.pkt counts all packets observed at the
+		 * RTP layer (including those later flagged as discard), so the
+		 * denominator pkt+loss already covers discards. loss and discard
+		 * are disjoint at the source. */
 		Ppl_rx = (rxStat.loss+rxStat.discard) * 100.0 / (rxStat.pkt + rxStat.loss);
 		Ppl_tx = (txStat.loss+txStat.discard) * 100.0 / (txStat.pkt + txStat.loss);
 
@@ -394,11 +722,15 @@ void TestCall::onStreamDestroyed(OnStreamDestroyedParam &prm) {
 		int rfactor_rx = 100 - Ie_eff_rx;
 		float mos_rx = rfactor_to_mos(rfactor_rx);
 		float BurstR_tx = 1.0;
-		Ie_eff_tx = (Ie + (95 - Ie) * Ppl_tx / (Ppl_rx/BurstR_tx + Bpl));
+		/* Was using Ppl_rx in the Tx denominator (copy-paste of the Rx
+		 * formula); Tx impairment must depend on Tx loss. */
+		Ie_eff_tx = (Ie + (95 - Ie) * Ppl_tx / (Ppl_tx/BurstR_tx + Bpl));
 		int rfactor_tx = 100 - Ie_eff_tx;
 		float mos_tx = rfactor_to_mos(rfactor_tx);
 
-		LOG(logINFO) << __FUNCTION__ <<": rtt:"<< rtcp.rttUsec.mean/1000 <<" mos_lq_tx:"<<mos_tx<<" mos_lq_rx:"<<mos_rx;
+		LOG(logINFO) << __FUNCTION__ <<": codec:"<< infos.codecName <<" Ie:"<< Ie
+		             <<" Bpl:"<< Bpl <<" rtt:"<< rtcp.rttUsec.mean/1000
+		             <<" mos_lq_tx:"<<mos_tx<<" mos_lq_rx:"<<mos_rx;
 		rtt = rtcp.rttUsec.mean/1000;
 
 		// MOS-CQ - Conversational Quality
@@ -423,14 +755,53 @@ void TestCall::onStreamDestroyed(OnStreamDestroyedParam &prm) {
 			Id = 25.0 * (pow((1+pow(X,6.0*sT)),(1.0/(6.0*sT)))-3.0*pow((1.0+pow(X/3.0,6.0*sT)),(1.0/(6.0*sT)))+2);
 		}
 		int rfactor_tx_cq = rfactor_tx - Id;
-		float mos_tx_cq = rfactor_to_mos(rfactor_tx);
+		/* Was converting rfactor_tx (LQ) instead of rfactor_tx_cq, so
+		 * mos_tx_cq was identical to mos_tx_lq. */
+		float mos_tx_cq = rfactor_to_mos(rfactor_tx_cq);
 		LOG(logINFO) << __FUNCTION__ <<": Rx-mos-lq["<<mos_tx<<"] Rx-mos-cq["<<mos_tx_cq<<"] >> Ta["<<Ta<<"]RTCP_jitterX2ms["<<txStat.jitterUsec.mean/500<<"]";
+
+		/* Plumb the worst-direction MOS values into Test so min_mos can
+		 * actually gate pass/fail (LQ) and the JSON summary can report
+		 * CQ. Across multiple streams (e.g. after re-INVITE) keep the
+		 * lowest value seen. */
+		{
+			float worst_lq = (mos_rx    < mos_tx)    ? mos_rx    : mos_tx;
+			float worst_cq = (mos_rx_cq < mos_tx_cq) ? mos_rx_cq : mos_tx_cq;
+			if (test->mos == 0 || worst_lq < test->mos)
+				test->mos = worst_lq;
+			if (test->mos_cq == 0 || worst_cq < test->mos_cq)
+				test->mos_cq = worst_cq;
+		}
 
 		// Another interesting study to consider ...
 		// https://www.naun.org/main/NAUN/mcs/2002-124.pdf
 
 		if (test->rtp_stats_count > 0)
 			test->rtp_stats_json = test->rtp_stats_json + ',';
+
+		// Energy fields are opt-in via energy_stats="true" on the action so
+		// the default rtp_stats output stays lean. When off, the Tx/Rx
+		// blocks end right after mos_cq; when on, we append the sampled
+		// level_* counters plus the player_* cross-check on Tx.
+		string tx_energy_json = "";
+		string rx_energy_json = "";
+		if (test->energy_stats) {
+			tx_energy_json = ", "
+				"\"level_peak\": "+to_string(test->tx_level_peak)+", "
+				"\"level_avg\": "+to_string(test->tx_level_samples ? test->tx_level_sum / test->tx_level_samples : 0)+", "
+				"\"voice_frames\": "+to_string(test->tx_voice_frames)+", "
+				"\"samples\": "+to_string(test->tx_level_samples)+", "
+				"\"player_level_peak\": "+to_string(test->tx_player_level_peak)+", "
+				"\"player_level_avg\": "+to_string(test->tx_player_level_samples ? test->tx_player_level_sum / test->tx_player_level_samples : 0)+", "
+				"\"player_voice_frames\": "+to_string(test->tx_player_voice_frames)+", "
+				"\"player_samples\": "+to_string(test->tx_player_level_samples);
+			rx_energy_json = ", "
+				"\"level_peak\": "+to_string(test->rx_level_peak)+", "
+				"\"level_avg\": "+to_string(test->rx_level_samples ? test->rx_level_sum / test->rx_level_samples : 0)+", "
+				"\"voice_frames\": "+to_string(test->rx_voice_frames)+", "
+				"\"samples\": "+to_string(test->rx_level_samples);
+		}
+
 		test->rtp_stats_json = test->rtp_stats_json + "{\"rtt\":"+to_string(rtt)+","
 						"\"remote_rtp_socket\": \""+infos.remoteRtpAddress+"\", "
 						"\"codec_name\": \""+infos.codecName+"\", "
@@ -442,7 +813,8 @@ void TestCall::onStreamDestroyed(OnStreamDestroyedParam &prm) {
 							"\"kbytes\": "+to_string(txStat.bytes/1024)+", "
 							"\"loss\": "+to_string(txStat.loss)+", "
 							"\"discard\": "+to_string(txStat.discard)+", "
-							"\"mos_lq\": "+to_string(mos_tx)+"} "
+							"\"mos_lq\": "+to_string(mos_tx)+", "
+							"\"mos_cq\": "+to_string(mos_tx_cq)+tx_energy_json+"} "
 						", \"Rx\":{"
 							"\"jitter_avg\": "+to_string(rxStat.jitterUsec.mean/1000)+", "
 							"\"jitter_max\": "+to_string(rxStat.jitterUsec.max/1000)+", "
@@ -450,7 +822,8 @@ void TestCall::onStreamDestroyed(OnStreamDestroyedParam &prm) {
 							"\"kbytes\": "+to_string(rxStat.bytes/1024)+", "
 							"\"loss\": "+to_string(rxStat.loss)+", "
 							"\"discard\": "+to_string(jbuf.discard)+", "
-							"\"mos_lq\": "+to_string(mos_rx)+"} "
+							"\"mos_lq\": "+to_string(mos_rx)+", "
+							"\"mos_cq\": "+to_string(mos_rx_cq)+rx_energy_json+"} "
 						"}";
 		test->rtp_stats_count++;
 		test->rtp_stats_ready = true;
@@ -486,9 +859,12 @@ void TestCall::onCallState(OnCallStateParam &prm) {
 	}
 
 	CallInfo ci = getInfo();
+	LOG(logINFO) <<__FUNCTION__<<" ENTRY: state="<<ci.state<<" stateText="<<ci.stateText<<" disconnecting="<<disconnecting;
 
-	if (disconnecting == true && ci.state != PJSIP_INV_STATE_DISCONNECTED)
+	if (disconnecting == true && ci.state != PJSIP_INV_STATE_DISCONNECTED) {
+		LOG(logINFO) <<__FUNCTION__<<" EARLY_RETURN: disconnecting=true, state="<<ci.state<<" (not DISCONNECTED)";
 		return;
+	}
 
 	int uri_prefix = 3; // sip:
 	std::string remote_user("");
@@ -553,11 +929,18 @@ void TestCall::onCallState(OnCallStateParam &prm) {
 			}
 		}
 	}
-	// Create player and recorder
-	if (ci.state == PJSIP_INV_STATE_CONFIRMED){
+	if (ci.state == PJSIP_INV_STATE_EARLY && durationBeforeEarly == 0){
+		durationBeforeEarly = ci.totalDuration.sec*1000 + ci.totalDuration.msec;
+		LOG(logINFO) <<__FUNCTION__<<": RINGING/EARLY PDD: "<< durationBeforeEarly;
+	}
+	// Create player and recorder.
+	// Skip when we already initiated hangup in the block above: pjsua starts
+	// tearing media down and the call's conf_slot may already be invalid.
+	if (ci.state == PJSIP_INV_STATE_CONFIRMED && !disconnecting){
 		if (test->play_dtmf.length() > 0) {
-			dialDtmf(test->play_dtmf);
-			LOG(logINFO) <<__FUNCTION__<<": [dtmf]" << test->play_dtmf;
+			test->dtmf_sequence = parseDtmfSequence(test->play_dtmf);
+			test->dtmf_seq_index = 0;
+			LOG(logINFO) <<__FUNCTION__<<": [dtmf] parsed " << test->dtmf_sequence.size() << " chunks from: " << test->play_dtmf;
 		}
 		stream_to_call(this, ci.id, test->remote_user.c_str());
 		if (!test->is_recording_running && test->record) {
@@ -565,17 +948,31 @@ void TestCall::onCallState(OnCallStateParam &prm) {
 				test->is_recording_running = true;
 			}
 		}
+		if (tx_recorder_id < 0 && test->record_tx) {
+			record_tx_call("record_", this, test->remote_user.c_str());
+		}
+		attach_meter_sink(this, ci.id);
 	}
 	if (ci.state == PJSIP_INV_STATE_DISCONNECTED) {
 		std::string res = "call[" + std::to_string(ci.lastStatusCode) + "] reason["+ ci.lastReason +"]";
 		LOG(logINFO) <<__FUNCTION__<<": [Call disconnected] red:"<< res;
 		if (player_id != -1) {
+			LOG(logINFO) <<__FUNCTION__<<" [onCallState] destroying player_id="<<player_id;
 			pjsua_player_destroy(player_id);
 			player_id = -1;
 		}
 		if (recorder_id != -1){
+			LOG(logINFO) <<__FUNCTION__<<" [onCallState] destroying recorder_id="<<recorder_id;
 			pjsua_recorder_destroy(recorder_id);
 			recorder_id = -1;
+		}
+		if (tx_recorder_id != -1){
+			pjsua_recorder_destroy(tx_recorder_id);
+			tx_recorder_id = -1;
+		}
+		if (tone_detector_id != -1){
+			pjsua_tone_detector_destroy(tone_detector_id);
+			tone_detector_id = -1;
 		}
 	}
 }
@@ -658,6 +1055,7 @@ void TestAccount::onIncomingCall(OnIncomingCallParam &iprm) {
 
 	CallInfo ci = call->getInfo();
 	CallOpParam prm;
+	prm.opt.textCount = 0;   // PSTN carriers reject m=text with 606
 	AccountInfo acc_inf = getInfo();
 
 	LOG(logINFO) <<__FUNCTION__<<":"<<" ["<< acc_inf.uri <<"]id["<<call->getId()<<"]from["<<ci.remoteUri<<"]to["<<ci.localUri<<"]id["<<ci.callIdString<<"]";
@@ -684,9 +1082,14 @@ void TestAccount::onIncomingCall(OnIncomingCallParam &iprm) {
 		call->test->state = VPT_RUN_WAIT;
 		call->test->rtp_stats = rtp_stats = true;
 		LOG(logINFO) <<__FUNCTION__<<": rtp_stats:" << rtp_stats;
+		call->test->energy_stats = energy_stats;
 		call->test->late_start = late_start;
 		call->test->record_early = record_early;
 		call->test->record = record;
+		call->test->record_tx = record_tx;
+		call->test->detect_tone = detect_tone;
+		call->test->hangup_on_tone = hangup_on_tone;
+		call->test->tones = tones.empty() ? std::vector<unsigned>{440u, 480u} : tones;
 		call->test->force_contact = force_contact;
 		call->test->code = (pjsip_status_code) code;
 		call->test->reason = reason;
@@ -707,9 +1110,9 @@ void TestAccount::onIncomingCall(OnIncomingCallParam &iprm) {
 	if (response_delay > 0) {
 		LOG(logINFO) << __FUNCTION__ << ": Not returning 100 due to response delay: " << response_delay << " ms";
 		calls.push_back(call);
+		config->new_calls_lock.lock();
 		if (call_count > 0)
 			call_count--;
-		config->new_calls_lock.lock();
 		config->new_calls.push_back(call);
 		config->new_calls_lock.unlock();
 		return;
@@ -735,9 +1138,9 @@ void TestAccount::onIncomingCall(OnIncomingCallParam &iprm) {
 	call->answer(prm);
 
 	calls.push_back(call);
+	config->new_calls_lock.lock();
 	if (call_count > 0)
 		call_count--;
-	config->new_calls_lock.lock();
 	config->new_calls.push_back(call);
 	config->new_calls_lock.unlock();
 }
@@ -847,6 +1250,10 @@ void Test::update_result() {
 		string jsonReason = reason;
 		jsonify(&jsonReason);
 
+		const bool tone_detected_v = tone_detected.load();
+		const unsigned tone_detected_ms_v = tone_detected_ms.load();
+		LOG(logINFO)<<__FUNCTION__<<"["<<this<<"]"<<" completed tone_detected:"<< tone_detected_v
+		            <<" tone_detected_ms:"<< tone_detected_ms_v;
 		std::string result_line_json = "{"
 				"\"label\": \""+label+"\", "
 				"\"start\": \""+start_time+"\", "
@@ -865,6 +1272,8 @@ void Test::update_result() {
 				"\"duration\": "+std::to_string(connect_duration)+", "
 				"\"expected_duration\": "+std::to_string(expected_duration)+", "
 				"\"max_duration\": "+std::to_string(max_duration)+", "
+				"\"tone_detected\": "+std::to_string(tone_detected_v)+", "
+				"\"tone_detected_ms\": "+std::to_string(tone_detected_ms_v)+", "
 				"\"hangup_duration\": "+std::to_string(hangup_duration);
 		if (dtmf_recv.length() > 0)
 			result_line_json += ", \"dtmf_recv\": \""+dtmf_recv+"\"";
@@ -909,11 +1318,11 @@ void Test::update_result() {
 
 		if (rtp_stats && rtp_stats_ready)
 			result_line_json += ", \"rtp_stats\":[" + rtp_stats_json + "]";
-		result_line_json += "}";
+		result_line_json += "}\n";
 
-		config->result_file.write(result_line_json);
-		LOG(logINFO)<<__FUNCTION__<<"["<<now<<"]" << result_line_json;
+		config->result_file.write(result_line_json); // endline missing mutex sync 
 		config->result_file.flush();
+		LOG(logINFO)<<__FUNCTION__<<"["<<now<<"]" << result_line_json;
 
 		LOG(logINFO)<<" ["<<type<<"]"<<endl;
 
@@ -971,7 +1380,7 @@ ResultFile::ResultFile(string name) : name(name) {
 
 bool ResultFile::write(string res) {
 	try {
-		file << res << "\n";
+		file << res;
 	} catch (Error & err) {
 		LOG(logINFO) <<__FUNCTION__<< "Exception: " << err.info() ;
 		return false;
@@ -1373,6 +1782,8 @@ int main(int argc, char **argv){
 	bool tcp_only = false;
 	bool udp_only = false;
 	int timer_ms = 0;
+	int max_calls = 60;
+	std::vector<std::string> nameservers;
 	config.rtp_cfg.port = 4000;
 	ep.config = &config;
 	config.ep = &ep;
@@ -1402,6 +1813,9 @@ int main(int argc, char **argv){
             " --bound-addr <IP>                 Bind transports to this IP interface\n"\
             " --rtp-port <1-65535>              Starting port of the range used for RTP\n"\
             " --rtp-port-end <1-65535>          End of of the range range used for RTP\n"\
+            " --record-dir <path>               Directory where call recordings are written (default /voice_files/)\n"\
+            " --max-calls <N>                   Maximum number of concurrent calls (default 50)\n"\
+            " --nameserver <IP|host>            DNS nameserver for SIP SRV/NAPTR resolution; repeat for multiple\n"\
             "                                                             \n";
 			return 0;
 		} else if ( (arg == "-v") || (arg == "--version") ) {
@@ -1414,6 +1828,14 @@ int main(int argc, char **argv){
 		} else if ( (arg == "-t") || (arg == "--timer_ms") ) {
 			if (i + 1 < argc) {
 				timer_ms = atoi(argv[++i]);
+			}
+		} else if ( arg == "--max-calls" ) {
+			if (i + 1 < argc) {
+				max_calls = atoi(argv[++i]);
+			}
+		} else if ( arg == "--nameserver" ) {
+			if (i + 1 < argc) {
+				nameservers.push_back(argv[++i]);
 			}
 		} else if ( (arg == "--graceful-shutdown") ) {
 			config.graceful_shutdown = true;
@@ -1448,6 +1870,13 @@ int main(int argc, char **argv){
 			config.rtp_cfg.port = atoi(argv[++i]);
 		} else if (arg == "--rtp-port-end") {
 			config.rtp_cfg.port_range = atoi(argv[++i]);
+		} else if (arg == "--record-dir") {
+			if (i + 1 < argc) {
+				config.record_dir = argv[++i];
+				if (!config.record_dir.empty() && config.record_dir.back() != '/') {
+					config.record_dir.push_back('/');
+				}
+			}
 		} else if (arg == "--tls-privkey") {
 			config.tls_cfg.private_key = argv[++i];
 		} else if (arg == "--tls-verify-client") {
@@ -1514,15 +1943,17 @@ int main(int argc, char **argv){
 			PJ_ASSERT_RETURN(status == PJ_SUCCESS, status);
 		}
 		EpConfig ep_cfg;
-		ep_cfg.uaConfig.maxCalls = 1000;
+		ep_cfg.uaConfig.maxCalls = max_calls;
 		ep_cfg.logConfig.level = log_level_file;
 		ep_cfg.logConfig.consoleLevel = log_level_console;
 		std::string pj_log_fn =  log_fn_pjsua;
 		ep_cfg.logConfig.filename = pj_log_fn.c_str();
 		ep_cfg.medConfig.ecTailLen = 0; // disable echo canceller
 		ep_cfg.medConfig.noVad = 1;
-		//ep_cfg.uaConfig.nameserver.push_back("8.8.8.8");
-
+		for (const auto& ns : nameservers) {
+			ep_cfg.uaConfig.nameserver.push_back(ns);
+			LOG(logINFO) << "nameserver: " << ns;
+		}
 		ep.libInit(ep_cfg);
 		// pjsua_set_null_snd_dev() before calling pjsua_start().
 
@@ -1689,14 +2120,15 @@ int main(int argc, char **argv){
 			pjsua_call_info pj_ci;
 			CallInfo ci;
 			if (call->is_disconnecting()) { // wait for call disconnections
+					LOG(logINFO) <<__FUNCTION__<<": wait for call disconnections, removing call["<< call->getId() <<"]["<< call <<"] "<< config.removeCall(call);
 					if (call->test && call->test->completed) config.removeCall(call);
 					disconnecting = true;
 					continue;
 			}
 			pj_status_t status = pjsua_call_get_info(call->getId(), &pj_ci);
-			LOG(logINFO) << "disconnecting >>> call["<< call->getId() <<"]["<< call <<"] ";
+			LOG(logINFO) <<__FUNCTION__<<": disconnecting >>> call["<< call->getId() <<"]["<< call <<"] ";
 			if (status != PJ_SUCCESS) {
-				LOG(logINFO) << "can not get call info, removing call["<< call->getId() <<"]["<< call <<"] "<< config.removeCall(call);
+				LOG(logINFO) <<__FUNCTION__<<": can not get call info, removing call["<< call->getId() <<"]["<< call <<"] "<< config.removeCall(call);
 				continue;
 			}
 			ci.fromPj(pj_ci);
@@ -1710,8 +2142,7 @@ int main(int argc, char **argv){
 					LOG(logERROR) <<__FUNCTION__<<" error :" << e.status;
 				}
 			} else {
-				// LOG(logINFO) << "removing call["<< call->getId() <<"]["<< call <<"] "<< config.removeCall(call);
-				LOG(logINFO) << "disconnected call["<< call->getId() <<"]["<< call <<"]";
+				LOG(logINFO) <<__FUNCTION__<<": disconnected call["<< call->getId() <<"]["<< call <<"]";
 				pj_thread_sleep(500);
 			}
 		}
