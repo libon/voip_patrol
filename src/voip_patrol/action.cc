@@ -20,6 +20,7 @@
 #include "action.hh"
 #include "util.hh"
 #include "string.h"
+#include <algorithm>
 #include <pjsua2/presence.hpp>
 
 namespace {
@@ -121,6 +122,32 @@ void apply_ipv6_account_config(AccountConfig &acc_cfg, const Config *config, con
 		acc_cfg.mediaConfig.transportConfig.publicAddress = config->ip_cfg.public_address;
 	}
 }
+
+/* Parse a comma-separated list of positive integers (e.g. "440,480") into a
+ * vector. Whitespace around entries is tolerated. Returns the default list
+ * (US ringback 440+480) if the input is empty. */
+std::vector<unsigned> parse_tones(const std::string &s) {
+	std::vector<unsigned> out;
+	if (s.empty()) {
+		out = {440u, 480u};
+		return out;
+	}
+	std::stringstream ss(s);
+	std::string item;
+	while (std::getline(ss, item, ',')) {
+		size_t start = item.find_first_not_of(" \t");
+		if (start == std::string::npos) continue;
+		try {
+			out.push_back((unsigned)std::stoul(item.substr(start)));
+		} catch (...) {
+			LOG(logERROR) << "parse_tones: skipping invalid entry '" << item << "'";
+		}
+	}
+	if (out.empty())
+		out = {440u, 480u};
+	return out;
+}
+
 } // namespace
 
 Action::Action(Config *cfg) : config{cfg} {
@@ -161,8 +188,11 @@ bool Action::set_param(ActionParam &param, const char *val) {
 		subst = true;
 	}
 	if (param.type == APType::apt_bool) {
-		if (subst) tmp_val = get_env(val).c_str();
-		else tmp_val = val;
+		string env_val; // keeps the substituted value alive while tmp_val points into it
+		if (subst) {
+			env_val = get_env(val);
+			tmp_val = env_val.c_str();
+		} else tmp_val = val;
 		if( strcmp(tmp_val, "false") ==  0 )  param.b_val = false;
 		else param.b_val = true;
 	} else if (param.type == APType::apt_integer) {
@@ -178,6 +208,7 @@ bool Action::set_param(ActionParam &param, const char *val) {
 		    param.s_val = val;
 		}
 	}
+	param.set = true;
 	return true;
 }
 
@@ -221,12 +252,18 @@ void Action::init_actions_params() {
 	do_call_params.push_back(ActionParam("wait_until", false, APType::apt_string));
 	do_call_params.push_back(ActionParam("max_duration", false, APType::apt_integer));
 	do_call_params.push_back(ActionParam("repeat", false, APType::apt_integer));
+	do_call_params.push_back(ActionParam("repeat_interval", false, APType::apt_integer));
 	do_call_params.push_back(ActionParam("max_ringing_duration", false, APType::apt_integer));
 	do_call_params.push_back(ActionParam("min_mos", false, APType::apt_float));
 	do_call_params.push_back(ActionParam("rtp_stats", false, APType::apt_bool));
+	do_call_params.push_back(ActionParam("energy_stats", false, APType::apt_bool));
 	do_call_params.push_back(ActionParam("late_start", false, APType::apt_bool));
 	do_call_params.push_back(ActionParam("record_early", false, APType::apt_bool));
 	do_call_params.push_back(ActionParam("record", false, APType::apt_bool));
+	do_call_params.push_back(ActionParam("record_tx", false, APType::apt_bool));
+	do_call_params.push_back(ActionParam("detect_tone", false, APType::apt_bool));
+	do_call_params.push_back(ActionParam("tones", false, APType::apt_string));
+	do_call_params.push_back(ActionParam("hangup_on_tone", false, APType::apt_bool));
 	do_call_params.push_back(ActionParam("srtp", false, APType::apt_string));
 	do_call_params.push_back(ActionParam("force_contact", false, APType::apt_string));
 	do_call_params.push_back(ActionParam("hangup", false, APType::apt_integer));
@@ -264,9 +301,14 @@ void Action::init_actions_params() {
 	do_accept_params.push_back(ActionParam("re_invite_interval", false, APType::apt_integer));
 	do_accept_params.push_back(ActionParam("min_mos", false, APType::apt_float));
 	do_accept_params.push_back(ActionParam("rtp_stats", false, APType::apt_bool));
+	do_accept_params.push_back(ActionParam("energy_stats", false, APType::apt_bool));
 	do_accept_params.push_back(ActionParam("late_start", false, APType::apt_bool));
 	do_accept_params.push_back(ActionParam("record_early", false, APType::apt_bool));
 	do_accept_params.push_back(ActionParam("record", false, APType::apt_bool));
+	do_accept_params.push_back(ActionParam("record_tx", false, APType::apt_bool));
+	do_accept_params.push_back(ActionParam("detect_tone", false, APType::apt_bool));
+	do_accept_params.push_back(ActionParam("tones", false, APType::apt_string));
+	do_accept_params.push_back(ActionParam("hangup_on_tone", false, APType::apt_bool));
 	do_accept_params.push_back(ActionParam("srtp", false, APType::apt_string));
 	do_accept_params.push_back(ActionParam("force_contact", false, APType::apt_string));
 	do_accept_params.push_back(ActionParam("play", false, APType::apt_string));
@@ -380,7 +422,7 @@ void Action::do_message(vector<ActionParam> &params, vector<ActionCheck> &checks
 		else if (param.name.compare("password") == 0) password = param.s_val;
 		else if (param.name.compare("realm") == 0 && param.s_val != "") realm = param.s_val;
 		else if (param.name.compare("label") == 0) label = param.s_val;
-		else if (param.name.compare("expected_cause_code") == 0) expected_cause_code = param.i_val;
+		else if (param.name.compare("expected_cause_code") == 0 && param.set) expected_cause_code = param.i_val;
 	}
 
 	TestAccount *acc = config->findAccount(from);
@@ -473,7 +515,7 @@ void Action::do_register(vector<ActionParam> &params, vector<ActionCheck> &check
 		else if (param.name.compare("instance_id") == 0) instance_id = param.s_val;
 		else if (param.name.compare("unregister") == 0) unregister = param.b_val;
 		else if (param.name.compare("rewrite_contact") == 0) rewrite_contact = param.b_val;
-		else if (param.name.compare("expected_cause_code") == 0) expected_cause_code = param.i_val;
+		else if (param.name.compare("expected_cause_code") == 0 && param.set) expected_cause_code = param.i_val;
 		else if (param.name.compare("srtp") == 0 && param.s_val.length() > 0) srtp = param.s_val;
 	}
 
@@ -707,9 +749,14 @@ void Action::do_accept(vector<ActionParam> &params, vector<ActionCheck> &checks,
 	int re_invite_interval {0};
 	call_state_t wait_until {INV_STATE_NULL};
 	bool rtp_stats {false};
+	bool energy_stats {false};
 	bool late_start {false};
 	bool record_early {false};
 	bool record {false};
+	bool record_tx {false};
+	bool detect_tone {false};
+	bool hangup_on_tone {true};
+	string tones_str {};
 	string srtp {"none"};
 	int code {200};
 	int call_count {-1};
@@ -732,11 +779,16 @@ void Action::do_accept(vector<ActionParam> &params, vector<ActionCheck> &checks,
 		else if (param.name.compare("early_media") == 0) early_media = param.b_val;
 		else if (param.name.compare("min_mos") == 0) min_mos = param.f_val;
 		else if (param.name.compare("rtp_stats") == 0) rtp_stats = param.b_val;
+		else if (param.name.compare("energy_stats") == 0) energy_stats = param.b_val;
 		else if (param.name.compare("srtp") == 0 && param.s_val.length() > 0) srtp = param.s_val;
 		else if (param.name.compare("force_contact") == 0) force_contact = param.s_val;
 		else if (param.name.compare("late_start") == 0) late_start = param.b_val;
 		else if (param.name.compare("record_early") == 0) record_early = param.b_val;
 		else if (param.name.compare("record") == 0) record = param.b_val;
+		else if (param.name.compare("record_tx") == 0) record_tx = param.b_val;
+		else if (param.name.compare("detect_tone") == 0) detect_tone = param.b_val;
+		else if (param.name.compare("tones") == 0) tones_str = param.s_val;
+		else if (param.name.compare("hangup_on_tone") == 0 && param.set) hangup_on_tone = param.b_val;
 		else if (param.name.compare("wait_until") == 0) wait_until = get_call_state_from_string(param.s_val);
 		else if (param.name.compare("hangup") == 0) hangup_duration = param.i_val;
 		else if (param.name.compare("cancel") == 0) cancel_duration = param.i_val;
@@ -751,8 +803,14 @@ void Action::do_accept(vector<ActionParam> &params, vector<ActionCheck> &checks,
 	vp::tolower(transport);
 	string transport_param = normalize_transport_param(transport);
 
+	// Always rebuild acc_cfg and modify/create the account so the accept
+	// action's parameters (transport, timer, srtp, force_contact, idUri) are
+	// applied even when reusing an existing account (e.g. "default").
+	// Binding sipConfig.transportId is what lets pjsua's Contact resolution
+	// use the transport's advertised (public) address rather than the bound
+	// interface IP returned by get_net_interface().
 	TestAccount *acc = config->findAccount(account_name);
-	if (!acc || force_contact != "") {
+	{
 		AccountConfig acc_cfg;
 		setTurnConfig(acc_cfg, config);
 		apply_ipv6_account_config(acc_cfg, config, account_name, transport);
@@ -808,6 +866,16 @@ void Action::do_accept(vector<ActionParam> &params, vector<ActionCheck> &checks,
 			LOG(logINFO) <<__FUNCTION__<<" Forcing SRTP";
 		}
 
+		// Config::createAccount unconditionally applies ip_cfg.bound/public
+		// addresses to mediaConfig.transportConfig, but modify() does not — so
+		// re-apply them here for the modify path.
+		if (!config->ip_cfg.bound_address.empty()) {
+			acc_cfg.mediaConfig.transportConfig.boundAddress = config->ip_cfg.bound_address;
+		}
+		if (!config->ip_cfg.public_address.empty()) {
+			acc_cfg.mediaConfig.transportConfig.publicAddress = config->ip_cfg.public_address;
+		}
+
 		if (acc) {
 			acc->modify(acc_cfg);
 		} else {
@@ -821,9 +889,14 @@ void Action::do_accept(vector<ActionParam> &params, vector<ActionCheck> &checks,
 	acc->ring_duration = ring_duration;
 	acc->accept_label = label;
 	acc->rtp_stats = rtp_stats;
+	acc->energy_stats = energy_stats;
 	acc->late_start = late_start;
 	acc->record_early = record_early;
 	acc->record = record;
+	acc->record_tx = record_tx;
+	acc->detect_tone = detect_tone;
+	acc->hangup_on_tone = hangup_on_tone;
+	acc->tones = parse_tones(tones_str);
 	acc->play = play;
 	acc->play_dtmf = play_dtmf;
 	acc->timer = timer;
@@ -868,11 +941,17 @@ void Action::do_call(vector<ActionParam> &params, vector<ActionCheck> &checks, S
 	int early_cancel {0};
 	int re_invite_interval {0};
 	int repeat {0};
+	int repeat_interval {0};
 	bool recording {false};
 	bool rtp_stats {false};
+	bool energy_stats {false};
 	bool late_start {false};
 	bool record {false};
+	bool record_tx {false};
 	bool record_early {false};
+	bool detect_tone {false};
+	bool hangup_on_tone {true};
+	string tones_str {};
 	string force_contact {};
 
 	for (auto param : params) {
@@ -890,13 +969,18 @@ void Action::do_call(vector<ActionParam> &params, vector<ActionCheck> &checks, S
 		else if (param.name.compare("realm") == 0 && param.s_val != "") realm = param.s_val;
 		else if (param.name.compare("label") == 0) label = param.s_val;
 		else if (param.name.compare("proxy") == 0) proxy = param.s_val;
-		else if (param.name.compare("expected_cause_code") == 0) expected_cause_code = param.i_val;
+		else if (param.name.compare("expected_cause_code") == 0 && param.set) expected_cause_code = param.i_val;
 		else if (param.name.compare("wait_until") == 0) wait_until = get_call_state_from_string(param.s_val);
 		else if (param.name.compare("min_mos") == 0) min_mos = param.f_val;
 		else if (param.name.compare("rtp_stats") == 0) rtp_stats = param.b_val;
+		else if (param.name.compare("energy_stats") == 0) energy_stats = param.b_val;
 		else if (param.name.compare("late_start") == 0) late_start = param.b_val;
 		else if (param.name.compare("record_early") == 0) record_early = param.b_val;
 		else if (param.name.compare("record") == 0) record = param.b_val;
+		else if (param.name.compare("record_tx") == 0) record_tx = param.b_val;
+		else if (param.name.compare("detect_tone") == 0) detect_tone = param.b_val;
+		else if (param.name.compare("tones") == 0) tones_str = param.s_val;
+		else if (param.name.compare("hangup_on_tone") == 0 && param.set) hangup_on_tone = param.b_val;
 		else if (param.name.compare("srtp") == 0 && param.s_val.length() > 0) srtp = param.s_val;
 		else if (param.name.compare("force_contact") == 0) force_contact = param.s_val;
 		else if (param.name.compare("max_duration") == 0) max_duration = param.i_val;
@@ -905,6 +989,7 @@ void Action::do_call(vector<ActionParam> &params, vector<ActionCheck> &checks, S
 		else if (param.name.compare("hangup") == 0) hangup_duration = param.i_val;
 		else if (param.name.compare("re_invite_interval") == 0) re_invite_interval = param.i_val;
 		else if (param.name.compare("repeat") == 0) repeat = param.i_val;
+		else if (param.name.compare("repeat_interval") == 0) repeat_interval = param.i_val;
 		else if (param.name.compare("early_cancel") == 0) early_cancel = param.i_val;
 		else if (param.name.compare("recording") == 0) recording = true;
 	}
@@ -1001,15 +1086,7 @@ void Action::do_call(vector<ActionParam> &params, vector<ActionCheck> &checks, S
 			acc_cfg.idUri = from;
 		}
 
-		if (!realm.empty() && realm != "*") {
-			if (username.empty() || password.empty()) {
-				if (username.empty()) {
-					LOG(logERROR) <<__FUNCTION__<< ": realm specified missing username";
-					return;
-				}
-				LOG(logERROR) <<__FUNCTION__<<": realm specified missing password";
-				return;
-			}
+		if (!username.empty() && !password.empty()) {
 			acc_cfg.sipConfig.authCreds.push_back( AuthCredInfo("digest", realm, username, 0, password) );
 		}
 
@@ -1051,11 +1128,16 @@ void Action::do_call(vector<ActionParam> &params, vector<ActionCheck> &checks, S
 		test->re_invite_next = re_invite_interval;
 		test->recording = recording;
 		test->rtp_stats = rtp_stats;
+		test->energy_stats = energy_stats;
 		test->late_start = late_start;
 		test->record_early = record_early;
-		LOG(logERROR) <<__FUNCTION__<<": record early["<<record_early<<"]";
-
 		test->record = record;
+		test->record_tx = record_tx;
+		test->detect_tone = detect_tone;
+		test->hangup_on_tone = hangup_on_tone;
+		test->tones = parse_tones(tones_str);
+		LOG(logINFO) <<__FUNCTION__<<": record_early["<<record_early<<"] detect_tone["
+		             <<detect_tone<<"] tones["<<tones_str<<"] hangup_on_tone["<<hangup_on_tone<<"]";
 		test->force_contact = force_contact;
 		test->srtp = srtp;
 		test->cancel = early_cancel;
@@ -1085,6 +1167,7 @@ void Action::do_call(vector<ActionParam> &params, vector<ActionCheck> &checks, S
 
 		prm.opt.audioCount = 1;
 		prm.opt.videoCount = 0;
+		prm.opt.textCount = 0;   // PSTN carriers (e.g. Flowroute) 606 on m=text
 		LOG(logINFO) << "call->test:" << test << " " << call->test->type;
 		LOG(logINFO) << "calling :" +callee;
 		if (transport_param == "tls") {
@@ -1122,6 +1205,13 @@ void Action::do_call(vector<ActionParam> &params, vector<ActionCheck> &checks, S
 		}
 		pj_gettimeofday(&test->sip_latency.inviteSentTs);
 		repeat--;
+		/* Inter-call spacing to avoid flooding the remote peer. pjsua's
+		 * worker thread keeps processing SIP/media events while we sleep
+		 * here; only the next XML action is delayed. Skipped after the
+		 * final iteration so we don't add a tail delay. */
+		if (repeat >= 0 && repeat_interval > 0) {
+			pj_thread_sleep(repeat_interval);
+		}
 	} while (repeat >= 0);
 }
 
@@ -1214,6 +1304,14 @@ void Action::do_wait(vector<ActionParam> &params) {
 			config->new_calls.erase(it);
 			break;
 		}
+		// Read call_count under the same lock onIncomingCall decrements it under, and
+		// count calls still queued: otherwise an arriving call can be in neither place.
+		tests_running += config->new_calls.size();
+		for (auto & account : config->accounts) {
+			if (account->call_count > 0 && (duration_ms > 0 || duration_ms == -1)) {
+				tests_running++;
+			}
+		}
 		config->new_calls_lock.unlock();
 
 		for (auto & account : config->accounts) {
@@ -1224,27 +1322,34 @@ void Action::do_wait(vector<ActionParam> &params) {
 			} else if (account->test) {
 				tests_running++;
 			}
-			// accept/call_count, are considered "tests_running" when maximum duration is either not specified or reached.
-			if (account->call_count > 0 && (duration_ms > 0 || duration_ms == -1)) {
-				tests_running++;
-			}
 			// accept/message_count, are considered "tests_running" when maximum duration is either not specified or reached.
 			if (account->message_count > 0 && (duration_ms > 0 || duration_ms == -1)) {
 				tests_running++;
 			}
 		}
 
-		// prevent calls destruction while parsing looking at them
-		config->checking_calls.lock();
+		// prevent calls destruction while parsing looking at them.
+		// RAII lock: any exception from getInfo/answer/hangup below unwinds
+		// cleanly. Raw lock() + unlock() would leak the mutex on throw and
+		// permanently wedge do_wait (and self-deadlock the shutdown path,
+		// where ~TestCall re-acquires this same non-recursive mutex).
+		{
+		std::lock_guard<std::mutex> checking_calls_lg(config->checking_calls);
 
 		for (auto & call : config->calls) {
 			if (call->test && call->test->state == VPT_DONE){
-				//CallInfo ci = call->getInfo();
-				//if (ci.state == PJSIP_INV_STATE_DISCONNECTED)
-				//LOG(logINFO) << "delete call test["<<call->test<<"] = " << config->removeCall(call);
 				continue;
 			} else if (call->test) {
-				CallInfo ci = call->getInfo();
+				CallInfo ci;
+				try {
+					ci = call->getInfo();
+				} catch (pj::Error &e) {
+					// 171140 = PJSIP_ESESSIONTERMINATED: the call was torn
+					// down between iterations. Skip; it will be reaped later.
+					if (e.status != 171140)
+						LOG(logERROR) <<__FUNCTION__<<" getInfo error: "<< e.status;
+					continue;
+				}
 				if (status_update) {
 					LOG(logDEBUG) <<__FUNCTION__<<": [call]["<<call->getId()<<"][test]["<<(ci.role==0?"CALLER":"CALLEE")<<"]["
 						     << ci.callIdString <<"]["<<ci.remoteUri<<"]["<<ci.stateText<<"|"<<ci.state<<"]duration["
@@ -1253,35 +1358,52 @@ void Action::do_wait(vector<ActionParam> &params) {
 				int totalDurationMs = ci.totalDuration.sec*1000 + ci.totalDuration.msec;
 				if (ci.state == PJSIP_INV_STATE_CALLING || ci.state == PJSIP_INV_STATE_EARLY || ci.state == PJSIP_INV_STATE_INCOMING)  {
 					Test *test = call->test;
-					if (test->response_delay > 0 && totalDurationMs >= test->response_delay && ci.state == PJSIP_INV_STATE_INCOMING) {
+					if (test->tone_detected && test->hangup_on_tone) {
+						LOG(logINFO) <<" tone detected hangup";
+						CallOpParam prm(true);
+						try { call->hangup(prm); }
+						catch (pj::Error &e) {
+							if (e.status != 171140) LOG(logERROR) <<__FUNCTION__<<" hangup error: "<< e.status;
+						}
+					} else if (test->response_delay > 0 && totalDurationMs >= test->response_delay && ci.state == PJSIP_INV_STATE_INCOMING) {
 						CallOpParam prm;
+						prm.opt.textCount = 0;
 
-						// Explicitly answer with 100
-						CallOpParam prm_100;
-						prm_100.statusCode = PJSIP_SC_TRYING;
-						call->answer(prm_100);
+						try {
+							// Explicitly answer with 100
+							CallOpParam prm_100;
+							prm_100.statusCode = PJSIP_SC_TRYING;
+							call->answer(prm_100);
 
-						if (test->ring_duration > 0) {
-							prm.statusCode = PJSIP_SC_RINGING;
-							if (test->early_media)
-								prm.statusCode = PJSIP_SC_PROGRESS;
-							LOG(logINFO) <<" Answering call["<<call->getId()<<"] with "<<prm.statusCode<<" on call time: "<<totalDurationMs<<" ms";
-							call->answer(prm);
-						} else {
-							prm.reason = "OK";
+							if (test->ring_duration > 0) {
+								prm.statusCode = PJSIP_SC_RINGING;
+								if (test->early_media)
+									prm.statusCode = PJSIP_SC_PROGRESS;
+								LOG(logINFO) <<" Answering call["<<call->getId()<<"] with "<<prm.statusCode<<" on call time: "<<totalDurationMs<<" ms";
+								call->answer(prm);
+							} else {
+								prm.reason = "OK";
 
-							if (test->code) prm.statusCode = test->code;
-							else prm.statusCode = PJSIP_SC_OK;
-							call->answer(prm);
+								if (test->code) prm.statusCode = test->code;
+								else prm.statusCode = PJSIP_SC_OK;
+								call->answer(prm);
+							}
+						} catch (pj::Error &e) {
+							if (e.status != 171140) LOG(logERROR) <<__FUNCTION__<<" answer error: "<< e.status;
 						}
 					} else if (test->ring_duration > 0 && totalDurationMs >= (test->ring_duration * 1000 + test->response_delay)) {
 						CallOpParam prm;
+						prm.opt.textCount = 0;
 						//if (test->reason.size() > 0) prm.reason = test->reason;
 						prm.reason = "OK";
 						if (test->code) prm.statusCode = test->code;
 						else prm.statusCode = PJSIP_SC_OK;
-						call->answer(prm);
-					} else if (test->max_ringing_duration && (test->max_ringing_duration + test->response_delay) * 1000 <= totalDurationMs) {
+						try { call->answer(prm); }
+						catch (pj::Error &e) {
+							if (e.status != 171140) LOG(logERROR) <<__FUNCTION__<<" answer error: "<< e.status;
+						}
+					} else if (test->max_ringing_duration && (test->max_ringing_duration + test->response_delay) * 1000 <= std::max(0, totalDurationMs - call->durationBeforeEarly)) {
+						LOG(logINFO) <<" Call ringing ["<<call->getId()<<"] duration: "<<totalDurationMs<<"ms before ringing:"<<call->durationBeforeEarly<<"ms, max ringing duration:"<< (test->max_ringing_duration * 1000 + test->response_delay);
 						if (ci.totalDuration.sec > 0 && ci.totalDuration.msec < 110 && ci.totalDuration.sec % 10 == 0) {
 							LOG(logINFO) <<__FUNCTION__<<"[cancelling:call]["<<call->getId()<<"][test]["<<(ci.role==0?"CALLER":"CALLEE")<<"]["
 							     << ci.callIdString <<"]["<<ci.remoteUri<<"]["<<ci.stateText<<"|"<<ci.state<<"]duration["
@@ -1301,13 +1423,15 @@ void Action::do_wait(vector<ActionParam> &params) {
 					call->test->setup_duration = ci.totalDuration.sec - ci.connectDuration.sec;
 					call->test->result_cause_code = (int)ci.lastStatusCode;
 					call->test->reason = ci.lastReason;
+					if (call->test->energy_stats) sample_signal_levels(call);
 					// check re-invite
 					if (call->test->re_invite_interval && ci.connectDuration.sec >= call->test->re_invite_next){
 						if (ci.state == PJSIP_INV_STATE_CONFIRMED) {
 							CallOpParam prm(true);
 							prm.opt.audioCount = 1;
 							prm.opt.videoCount = 0;
-							LOG(logINFO) <<__FUNCTION__<<" re-invite : call in PJSIP_INV_STATE_CONFIRMED" ;
+							prm.opt.textCount = 0;
+							LOG(logINFO) <<__FUNCTION__<<": re-invite call in PJSIP_INV_STATE_CONFIRMED" ;
 							try {
 								call->reinvite(prm);
 								call->test->re_invite_next = call->test->re_invite_next + call->test->re_invite_interval;
@@ -1316,11 +1440,25 @@ void Action::do_wait(vector<ActionParam> &params) {
 							}
 						}
 					}
+					// check scheduled DTMF
+					if (call->test->dtmf_seq_index < (int)call->test->dtmf_sequence.size()) {
+						int connect_ms = ci.connectDuration.sec * 1000 + ci.connectDuration.msec;
+						while (call->test->dtmf_seq_index < (int)call->test->dtmf_sequence.size()
+						       && connect_ms >= call->test->dtmf_sequence[call->test->dtmf_seq_index].delay_ms) {
+							try {
+								call->dialDtmf(call->test->dtmf_sequence[call->test->dtmf_seq_index].digits);
+								LOG(logINFO) << __FUNCTION__ << " [dtmf] Sending sequence: " << call->test->dtmf_sequence[call->test->dtmf_seq_index].digits;
+							} catch (pj::Error& e) {
+								LOG(logERROR) << __FUNCTION__ << " [dtmf] error (" << e.status << "): " << e.reason;
+							}
+							call->test->dtmf_seq_index += 1;
+						}
+					}
 					// check hangup
 					if (call->test->hangup_duration && ci.connectDuration.sec >= call->test->hangup_duration){
 						if (ci.state == PJSIP_INV_STATE_CONFIRMED) {
 							CallOpParam prm(true);
-							LOG(logINFO) << "hangup : call in PJSIP_INV_STATE_CONFIRMED" ;
+							LOG(logINFO) <<__FUNCTION__<<": hangup call in PJSIP_INV_STATE_CONFIRMED" ;
 							try {
 								pj_gettimeofday(&call->test->sip_latency.byeSentTs);
 								call->hangup(prm);
@@ -1348,13 +1486,13 @@ void Action::do_wait(vector<ActionParam> &params) {
 				pos++;
  			}
 		}
-		config->checking_calls.unlock();
+		} // release checking_calls lock_guard before sleeping
 
 		if (tests_running == 0 && complete_all) {
 			LOG(logINFO) << __FUNCTION__ << ": action[wait] no more tests are running, exiting ... ";
 			completed = true;
 		} else if (duration_ms <= 0 && duration_ms != -1) {
-			LOG(logINFO) << __FUNCTION__ << ": action[wait] overall duration exceeded, exiting ... ";
+			LOG(logINFO) << __FUNCTION__ << ": action[wait] duration elapsed, returning ... ";
 			completed = true;
 		} else if (tests_running > 0 && complete_all) {
 			if (status_update) {
