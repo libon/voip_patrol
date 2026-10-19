@@ -826,8 +826,14 @@ void TestCall::onStreamDestroyed(OnStreamDestroyedParam &prm) {
 						"}";
 		test->rtp_stats_count++;
 		test->rtp_stats_ready = true;
-		if (ci.state == PJSIP_INV_STATE_CONFIRMED) return;
-		test->update_result();
+		/* Record the stats, but never complete the test from here. This
+		   callback runs while the INVITE session has already left EARLY
+		   (CONNECTING once a 2xx arrives, DISCONNECTED once a final error
+		   does) yet CallInfo still carries the previous provisional status
+		   code, so completing here reports e.g. 183 for a call that was in
+		   fact answered or rejected. onCallState() and the main loop complete
+		   the test from a terminal state with the final code, and pick these
+		   stats up through rtp_stats_ready. */
 	} catch (pj::Error e)  {
 			LOG(logERROR) <<__FUNCTION__<<" error :" << e.status << std::endl;
 	}
